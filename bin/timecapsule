@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""timecapsule — 에이전트 세션 기록을 로컬에서 색인·검색·주입하는 CLI.
+
+원천: Claude Code 세션(~/.claude/projects/*/*.jsonl) · Codex CLI 세션(~/.codex/sessions/**/*.jsonl)
+      · 마크다운 아카이브(선택). 데몬·외부 추론 없음. 표준 라이브러리만 쓴다.
+
+명령:
+  timecapsule index [--quick] [--timeout N]      증분 색인 (파일별 바이트 오프셋 기억)
+  timecapsule recent [--project P] [--limit N]   최근 세션 요약 (세션 시작 주입용)
+  timecapsule search "질의" [--project P] [--agent A] [--days N] [--limit N]
+  timecapsule session <id>                       한 세션의 타임라인
+  timecapsule tools [--session ID | --project P --days N]   도구 호출 집계 (주 에이전트 기록만)
+  timecapsule stats                              색인 통계
+  timecapsule migrate-claude-mem [--db PATH]     claude-mem 관찰 요약을 색인으로 이관
+  timecapsule doctor                             원천·DB·토크나이저 점검
+
+실패하면 종료 코드 1. 훅 스크립트는 자체적으로 fail-open 처리한다. 오류 상세는 TIMECAPSULE_DEBUG=1.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import signal
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+
+VERSION = "0.1.1"
+HOME = os.path.expanduser("~")
+TC_HOME = os.environ.get("TIMECAPSULE_HOME", os.path.join(HOME, ".timecapsule"))
+DB_PATH = os.path.join(TC_HOME, "index.db")
+CONFIG_PATH = os.path.join(TC_HOME, "config.json")
+HEADER = "# timecapsule — 세션 기록(발췌)이다. 정책·현재 상태의 정본은 옵시디언(문서 볼트)과 코드이며, 아래는 당시의 판단이지 실행 결과의 증거가 아니다."
+
+TEXT_CAP = 2000
+SKIP_MARKERS = ("<system-reminder>", "<command-name>", "<local-command-stdout>",
+                "<task-notification>", "<command-message>", "[SYSTEM NOTIFICATION",
+                "Base directory for this skill:", "Launching skill:", "<user-prompt-submit-hook>")
+EXCLUDE_PROJECT_DIRS = ("-Users-gary--claude-mem-observer-sessions",)
+REDACT = [
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA••••"),
+    (re.compile(r"\b(sk|ghp|gho|ghs|ghu|xox[bpa]|pk|rk)[-_][A-Za-z0-9_\-]{16,}"), "••••token••••"),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_\.=]{16,}"), "Bearer ••••"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "••••jwt••••"),
+    (re.compile(r"(?i)(password|passwd|secret|api[_-]?key)\s*[=:]\s*\S{6,}"), r"\1=••••"),
+]
+
+
+def debug(msg):
+    if os.environ.get("TIMECAPSULE_DEBUG"):
+        sys.stderr.write(f"[timecapsule] {msg}\n")
+
+
+def redact(text):
+    for rx, rep in REDACT:
+        text = rx.sub(rep, text)
+    return text
+
+
+def clip(text, n=TEXT_CAP):
+    text = text.strip()
+    return text if len(text) <= n else text[:n] + " …"
+
+
+def load_config():
+    cfg = {"extra_markdown_dirs": [], "exclude_project_dirs": list(EXCLUDE_PROJECT_DIRS)}
+    try:
+        with open(CONFIG_PATH) as fh:
+            cfg.update(json.load(fh))
+    except Exception:
+        pass
+    return cfg
+
+
+# ---------------------------------------------------------------- DB
+def connect():
+    os.makedirs(TC_HOME, exist_ok=True)
+    con = sqlite3.connect(DB_PATH, timeout=5)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS files(
+          path TEXT PRIMARY KEY, offset INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0,
+          mtime REAL NOT NULL DEFAULT 0, agent TEXT, session_id TEXT, project TEXT, indexed_at REAL);
+        CREATE TABLE IF NOT EXISTS entries(
+          id INTEGER PRIMARY KEY, agent TEXT NOT NULL, project TEXT, session_id TEXT NOT NULL,
+          ts TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, path TEXT, line INTEGER);
+        CREATE INDEX IF NOT EXISTS ix_entries_session ON entries(session_id, ts);
+        CREATE INDEX IF NOT EXISTS ix_entries_project_ts ON entries(project, ts);
+        CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+        """
+    )
+    tok = con.execute("SELECT v FROM meta WHERE k='tokenizer'").fetchone()
+    if not tok:
+        tokenizer = "trigram"
+        try:
+            con.execute("CREATE VIRTUAL TABLE fts USING fts5(text, content='entries', content_rowid='id', tokenize='trigram')")
+        except sqlite3.OperationalError:
+            tokenizer = "unicode61"
+            con.execute("CREATE VIRTUAL TABLE fts USING fts5(text, content='entries', content_rowid='id', tokenize='unicode61')")
+        con.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+              INSERT INTO fts(rowid, text) VALUES (new.id, new.text); END;
+            CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+              INSERT INTO fts(fts, rowid, text) VALUES('delete', old.id, old.text); END;
+            """
+        )
+        con.execute("INSERT INTO meta(k,v) VALUES('tokenizer',?)", (tokenizer,))
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('schema','1')")
+        con.commit()
+    return con
+
+
+def tokenizer(con):
+    row = con.execute("SELECT v FROM meta WHERE k='tokenizer'").fetchone()
+    return row[0] if row else "unicode61"
+
+
+# ---------------------------------------------------------------- 원천 파서
+def claude_text(content):
+    """Claude 메시지 content(str | list) → 사람이 읽을 텍스트. 도구 결과는 제외."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                parts.append(str(c.get("text", "")))
+    return "\n".join(parts)
+
+
+def parse_claude_line(o, state):
+    """한 줄 → (role, text) 또는 None. state 에 cwd·session 을 누적한다."""
+    if o.get("cwd") and not state.get("project"):
+        state["project"] = o["cwd"]
+    if o.get("sessionId") and not state.get("session_id"):
+        state["session_id"] = o["sessionId"]
+    t = o.get("type")
+    if o.get("isSidechain"):
+        return None
+    if t == "user":
+        m = o.get("message") or {}
+        text = claude_text(m.get("content"))
+        if not text or any(mk in text for mk in SKIP_MARKERS):
+            return None
+        if o.get("toolDenialKind"):
+            return None
+        return ("user", clip(text))
+    if t == "assistant":
+        m = o.get("message") or {}
+        out = []
+        for c in (m.get("content") or []):
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text" and c.get("text", "").strip():
+                out.append(("assistant", clip(c["text"])))
+            elif c.get("type") == "tool_use":
+                name = c.get("name", "?")
+                inp = c.get("input") or {}
+                detail = ""
+                if name == "Bash":
+                    detail = str(inp.get("command", "")).strip().split("\n")[0][:200]
+                elif name in ("Read", "Edit", "Write", "MultiEdit"):
+                    detail = str(inp.get("file_path", ""))[:200]
+                elif name == "Skill":
+                    detail = str(inp.get("skill", ""))
+                elif name == "Agent":
+                    detail = str(inp.get("description", ""))[:120]
+                out.append(("tool", f"{name} {detail}".strip()))
+        return out or None
+    return None
+
+
+def parse_codex_line(o, state):
+    t = o.get("type")
+    p = o.get("payload") or {}
+    if t == "session_meta":
+        state["project"] = p.get("cwd") or state.get("project")
+        state["session_id"] = p.get("id") or state.get("session_id")
+        state["originator"] = p.get("originator")
+        return None
+    if t == "turn_context" and p.get("cwd") and not state.get("project"):
+        state["project"] = p["cwd"]
+        return None
+    if t == "response_item":
+        pt = p.get("type")
+        if pt == "message":
+            role = p.get("role")
+            if role not in ("user", "assistant"):
+                return None
+            parts = []
+            for c in (p.get("content") or []):
+                if isinstance(c, dict) and c.get("type") in ("input_text", "output_text"):
+                    parts.append(str(c.get("text", "")))
+            text = "\n".join(parts)
+            if not text.strip():
+                return None
+            if role == "user" and text.lstrip().startswith(("<environment_context>", "<user_instructions>", "# AGENTS.md")):
+                return None
+            return (role, clip(text))
+        if pt in ("function_call", "custom_tool_call", "local_shell_call"):
+            name = p.get("name") or pt
+            args = p.get("arguments") or p.get("input") or ""
+            if isinstance(args, str):
+                try:
+                    a = json.loads(args)
+                    args = a.get("command") or a.get("cmd") or args
+                except Exception:
+                    m = re.search(r'cmd\s*:\s*"((?:[^"\\]|\\.)*)"', args)
+                    if m:
+                        args = m.group(1).encode().decode("unicode_escape", "ignore")
+            if isinstance(args, list):
+                args = " ".join(map(str, args))
+            return ("tool", clip(f"{name} {str(args).strip().splitlines()[0] if str(args).strip() else ''}", 240))
+    return None
+
+
+def line_ts(o, agent, fallback):
+    ts = o.get("timestamp")
+    if isinstance(ts, str) and ts:
+        return ts
+    return fallback
+
+
+# ---------------------------------------------------------------- 색인
+class Budget:
+    def __init__(self, seconds):
+        self.deadline = time.time() + seconds if seconds else None
+
+    def over(self):
+        return self.deadline is not None and time.time() > self.deadline
+
+
+def discover_sources(cfg):
+    """(agent, path) 목록. 최신 수정 순."""
+    out = []
+    excl = set(cfg.get("exclude_project_dirs") or [])
+    for d in glob.glob(os.path.join(HOME, ".claude", "projects", "*")):
+        if os.path.basename(d) in excl:
+            continue
+        for f in glob.glob(os.path.join(d, "*.jsonl")):
+            out.append(("claude", f))
+    for f in glob.glob(os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl"), recursive=True):
+        out.append(("codex", f))
+    for d in cfg.get("extra_markdown_dirs") or []:
+        for f in glob.glob(os.path.join(os.path.expanduser(d), "**", "*.md"), recursive=True):
+            out.append(("markdown", f))
+    out.sort(key=lambda ap: os.path.getmtime(ap[1]) if os.path.exists(ap[1]) else 0, reverse=True)
+    return out
+
+
+def index_file(con, agent, path, budget):
+    """한 파일을 기억된 오프셋부터 읽어 새 줄만 넣는다. 불완전한 마지막 줄은 다음에 다시 읽는다."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return 0
+    row = con.execute("SELECT offset, size, mtime, session_id, project FROM files WHERE path=?", (path,)).fetchone()
+    offset = row[0] if row else 0
+    if row and row[1] == st.st_size and abs(row[2] - st.st_mtime) < 1e-6:
+        return 0
+    if st.st_size < offset:  # 잘렸거나 다시 쓰인 파일 → 처음부터
+        con.execute("DELETE FROM entries WHERE path=?", (path,))
+        offset = 0
+    state = {"session_id": row[3] if row else None, "project": row[4] if row else None}
+    if agent == "markdown":
+        return index_markdown(con, path, st)
+    added = 0
+    file_fallback_ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        line_no = 0
+        while True:
+            pos = fh.tell()
+            raw = fh.readline()
+            if not raw:
+                break
+            if not raw.endswith(b"\n"):
+                # 아직 쓰는 중인 마지막 줄 — 다음 색인에 재처리
+                fh.seek(pos)
+                break
+            line_no += 1
+            try:
+                o = json.loads(raw.decode("utf-8", "ignore"))
+            except Exception:
+                continue
+            parsed = parse_claude_line(o, state) if agent == "claude" else parse_codex_line(o, state)
+            if not parsed:
+                continue
+            sid = state.get("session_id") or os.path.splitext(os.path.basename(path))[0]
+            ts = line_ts(o, agent, file_fallback_ts)
+            items = parsed if isinstance(parsed, list) else [parsed]
+            for role, text in items:
+                text = redact(text)
+                con.execute(
+                    "INSERT INTO entries(agent, project, session_id, ts, role, text, path, line) VALUES(?,?,?,?,?,?,?,?)",
+                    (agent, state.get("project"), sid, ts, role, text, path, line_no),
+                )
+                added += 1
+            if budget.over():
+                break
+        new_offset = fh.tell()
+    con.execute(
+        "INSERT OR REPLACE INTO files(path, offset, size, mtime, agent, session_id, project, indexed_at) VALUES(?,?,?,?,?,?,?,?)",
+        (path, new_offset, st.st_size if new_offset >= st.st_size else new_offset, st.st_mtime if new_offset >= st.st_size else 0,
+         agent, state.get("session_id"), state.get("project"), time.time()),
+    )
+    # 프로젝트가 늦게 확정된 경우 앞 항목 보정
+    if state.get("project"):
+        con.execute("UPDATE entries SET project=? WHERE path=? AND project IS NULL", (state["project"], path))
+    return added
+
+
+def index_markdown(con, path, st):
+    con.execute("DELETE FROM entries WHERE path=?", (path,))
+    with open(path, encoding="utf-8", errors="ignore") as fh:
+        text = fh.read()
+    ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+    m = re.search(r"(20\d\d-\d\d-\d\d)", os.path.basename(path))
+    if m:
+        ts = m.group(1) + "T00:00:00+00:00"
+    sid = "md:" + os.path.relpath(path, HOME)
+    chunks = re.split(r"\n(?=#{1,3} )", text)
+    n = 0
+    for i, ch in enumerate(chunks):
+        ch = ch.strip()
+        if len(ch) < 40:
+            continue
+        con.execute(
+            "INSERT INTO entries(agent, project, session_id, ts, role, text, path, line) VALUES(?,?,?,?,?,?,?,?)",
+            ("markdown", os.path.dirname(path), sid, ts, "note", redact(clip(ch, 3000)), path, i),
+        )
+        n += 1
+    con.execute(
+        "INSERT OR REPLACE INTO files(path, offset, size, mtime, agent, session_id, project, indexed_at) VALUES(?,?,?,?,?,?,?,?)",
+        (path, st.st_size, st.st_size, st.st_mtime, "markdown", sid, os.path.dirname(path), time.time()),
+    )
+    return n
+
+
+def cmd_index(args):
+    cfg = load_config()
+    con = connect()
+    budget = Budget(args.timeout if args.timeout else (4 if args.quick else None))
+    total = 0
+    files = 0
+    for agent, path in discover_sources(cfg):
+        if budget.over():
+            break
+        n = index_file(con, agent, path, budget)
+        if n:
+            total += n
+            files += 1
+        if files % 20 == 0:
+            con.commit()
+    con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_index', ?)", (datetime.now(timezone.utc).isoformat(),))
+    con.commit()
+    if not args.quiet:
+        print(f"indexed {total} entries from {files} files" + (" (budget hit)" if budget.over() else ""))
+
+
+# ---------------------------------------------------------------- 조회
+def project_filter_sql(project):
+    """현재 경로와 세션 cwd 가 서로 접두어 관계면 같은 프로젝트로 본다(워크트리·하위 저장소 포함)."""
+    if not project:
+        return "1=1", ()
+    p = os.path.abspath(os.path.expanduser(project)).rstrip("/")
+    return "(project = ? OR project LIKE ? OR ? LIKE project || '/%')", (p, p + "/%", p)
+
+
+def fmt_ts(ts):
+    try:
+        d = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        return d.strftime("%m-%d %H:%M")
+    except Exception:
+        return ts[:16]
+
+
+def short_project(p):
+    if not p:
+        return "-"
+    return p.replace(HOME, "~")
+
+
+def fts_query(q, tok):
+    terms = [t for t in re.split(r"\s+", q.strip()) if t]
+    if tok == "trigram":
+        terms = [t for t in terms if len(t) >= 3] or terms
+    return " AND ".join('"' + t.replace('"', '""') + '"' for t in terms)
+
+
+def cmd_search(args):
+    con = connect()
+    tok = tokenizer(con)
+    q = fts_query(args.query, tok)
+    where, params = project_filter_sql(args.project)
+    sql = (
+        "SELECT e.ts, e.agent, e.project, e.session_id, e.role, snippet(fts, 0, '[', ']', '…', 64), e.path, e.line "
+        "FROM fts JOIN entries e ON e.id = fts.rowid WHERE fts MATCH ? AND " + where
+    )
+    params = (q,) + params
+    if args.agent:
+        sql += " AND e.agent = ?"
+        params += (args.agent,)
+    if args.days:
+        since = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
+        sql += " AND e.ts >= ?"
+        params += (since,)
+    if args.role:
+        sql += " AND e.role = ?"
+        params += (args.role,)
+    sql += " ORDER BY e.ts DESC LIMIT ?"
+    params += (args.limit,)
+    rows = con.execute(sql, params).fetchall()
+    if args.json:
+        print(json.dumps([dict(ts=r[0], agent=r[1], project=r[2], session=r[3], role=r[4], snippet=r[5], path=r[6], line=r[7]) for r in rows], ensure_ascii=False))
+        return
+    print(HEADER)
+    if not rows:
+        print(f"(결과 없음: {args.query!r})")
+        return
+    for ts, agent, project, sid, role, snip, path, line in rows:
+        snip = " ".join(snip.split())
+        print(f"[{fmt_ts(ts)}] {agent} · {short_project(project)} · {role} · {sid[:8]}\n    {snip}")
+        if args.src:
+            print(f"    ↳ {short_project(path)}:{line}")
+
+
+def session_rows(con, where, params, limit):
+    sql = (
+        "SELECT session_id, agent, project, MIN(ts), MAX(ts), COUNT(*),"
+        " SUM(role='tool') FROM entries WHERE " + where + " AND agent != 'markdown'"
+        " GROUP BY session_id ORDER BY MAX(ts) DESC LIMIT ?"
+    )
+    return con.execute(sql, params + (limit,)).fetchall()
+
+
+def first_last(con, sid):
+    fu = con.execute("SELECT text FROM entries WHERE session_id=? AND role='user' ORDER BY ts, id LIMIT 1", (sid,)).fetchone()
+    la = con.execute("SELECT text FROM entries WHERE session_id=? AND role='assistant' ORDER BY ts DESC, id DESC LIMIT 1", (sid,)).fetchone()
+    return (fu[0] if fu else ""), (la[0] if la else "")
+
+
+def cmd_recent(args):
+    con = connect()
+    where, params = project_filter_sql(None if args.all else args.project)
+    if args.days:
+        since = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
+        where += " AND ts >= ?"
+        params += (since,)
+    rows = session_rows(con, where, params, args.limit)
+    if args.json:
+        out = []
+        for sid, agent, project, t0, t1, n, ntool in rows:
+            fu, la = first_last(con, sid)
+            out.append(dict(session=sid, agent=agent, project=project, start=t0, end=t1, entries=n, tools=ntool, first_user=fu, last_assistant=la))
+        print(json.dumps(out, ensure_ascii=False))
+        return
+    lines = [HEADER, "(각 세션은 첫 요청·마지막 결론만 발췌. 전개는 `timecapsule session <id>`)"]
+    if not rows:
+        lines.append("(이 프로젝트의 세션 기록 없음)")
+    budget = args.max_chars
+    for sid, agent, project, t0, t1, n, ntool in rows:
+        fu, la = first_last(con, sid)
+        fu = " ".join(fu.split())[:240]
+        la = " ".join(la.split())[:360]
+        block = (f"\n## {fmt_ts(t0)} → {fmt_ts(t1)} · {agent} · {short_project(project)} · {sid[:8]} · 항목 {n} (도구 {ntool or 0})\n"
+                 f"- 요청: {fu or '-'}\n- 마지막 결론: {la or '-'}")
+        if sum(len(x) for x in lines) + len(block) > budget:
+            lines.append("\n(길이 상한으로 이하 생략)")
+            break
+        lines.append(block)
+    print("\n".join(lines))
+
+
+def cmd_session(args):
+    con = connect()
+    rows = con.execute(
+        "SELECT ts, role, text FROM entries WHERE session_id LIKE ? ORDER BY ts, id", (args.id + "%",)
+    ).fetchall()
+    if not rows:
+        print("(세션 없음)")
+        return
+    print(HEADER)
+    for ts, role, text in rows:
+        text = " ".join(text.split())
+        print(f"[{fmt_ts(ts)}] {role}: {text[: args.width]}")
+
+
+def cmd_tools(args):
+    """지난 세션에서 무슨 도구를 썼는지 — cch 의 훅 이벤트 조회를 대신한다. 서브에이전트 기록은 제외된다."""
+    con = connect()
+    if args.session:
+        where, params = "session_id LIKE ?", (args.session + "%",)
+    else:
+        where, params = project_filter_sql(args.project)
+        if args.days:
+            since = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
+            where += " AND ts >= ?"
+            params += (since,)
+    rows = con.execute(
+        "SELECT text FROM entries WHERE role='tool' AND " + where + " ORDER BY ts", params
+    ).fetchall()
+    counts = {}
+    samples = {}
+    for (t,) in rows:
+        name = t.split(" ", 1)[0]
+        counts[name] = counts.get(name, 0) + 1
+        if name == "Bash" or name.startswith(("exec", "shell", "local_shell")):
+            k = t.split(" ", 1)[1][:80] if " " in t else ""
+            if k:
+                samples.setdefault(name, []).append(k)
+    print(HEADER)
+    print(f"도구 호출 {len(rows)}건 (주 에이전트 기록만, 서브에이전트 제외)")
+    for name, n in sorted(counts.items(), key=lambda kv: -kv[1])[: args.limit]:
+        print(f"  {n:6d}  {name}")
+    if args.commands:
+        seen = {}
+        for name, cmds in samples.items():
+            for c in cmds:
+                key = " ".join(c.split()[:2])
+                seen[key] = seen.get(key, 0) + 1
+        print("셸 명령 앞 두 토큰 (상위):")
+        for k, n in sorted(seen.items(), key=lambda kv: -kv[1])[: args.limit]:
+            print(f"  {n:6d}  {k}")
+
+
+def cmd_stats(args):
+    con = connect()
+    print(f"db: {DB_PATH} ({os.path.getsize(DB_PATH)//1024//1024} MB) · tokenizer: {tokenizer(con)}")
+    last = con.execute("SELECT v FROM meta WHERE k='last_index'").fetchone()
+    print(f"last index: {last[0] if last else '-'}")
+    for agent, n, s, t0, t1 in con.execute(
+        "SELECT agent, COUNT(*), COUNT(DISTINCT session_id), MIN(ts), MAX(ts) FROM entries GROUP BY agent"
+    ):
+        print(f"{agent:10s} entries {n:7d} · sessions {s:5d} · {t0[:10]} ~ {t1[:10]}")
+    print("projects (top 10):")
+    for p, n in con.execute(
+        "SELECT project, COUNT(DISTINCT session_id) FROM entries WHERE project IS NOT NULL GROUP BY project ORDER BY 2 DESC LIMIT 10"
+    ):
+        print(f"  {n:5d}  {short_project(p)}")
+
+
+def cmd_migrate_claude_mem(args):
+    src = os.path.expanduser(args.db)
+    if not os.path.exists(src):
+        print(f"없음: {src}")
+        return
+    con = connect()
+    done = con.execute("SELECT COUNT(*) FROM entries WHERE agent='claude-mem'").fetchone()[0]
+    if done and not args.force:
+        print(f"이미 이관됨 ({done}건). 다시 하려면 --force")
+        return
+    con.execute("DELETE FROM entries WHERE agent='claude-mem'")
+    s = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    n = 0
+    for sid, project, title, subtitle, text, facts, narrative, created in s.execute(
+        "SELECT memory_session_id, project, title, subtitle, text, facts, narrative, created_at FROM observations"
+    ):
+        parts = [x for x in (title, subtitle, narrative or text, facts) if x]
+        body = "\n".join(str(x) for x in parts)
+        if len(body) < 20:
+            continue
+        con.execute(
+            "INSERT INTO entries(agent, project, session_id, ts, role, text, path, line) VALUES(?,?,?,?,?,?,?,?)",
+            ("claude-mem", project, f"cm:{sid}", created or "", "observation", redact(clip(body, 3000)), src, n),
+        )
+        n += 1
+    try:
+        for sid, project, request, investigated, learned, completed, nxt, created in s.execute(
+            "SELECT memory_session_id, project, request, investigated, learned, completed, next_steps, created_at FROM session_summaries"
+        ):
+            body = "\n".join(f"{k}: {v}" for k, v in (("요청", request), ("조사", investigated), ("배운 것", learned), ("완료", completed), ("다음", nxt)) if v)
+            if len(body) < 20:
+                continue
+            con.execute(
+                "INSERT INTO entries(agent, project, session_id, ts, role, text, path, line) VALUES(?,?,?,?,?,?,?,?)",
+                ("claude-mem", project, f"cm:{sid}", created or "", "summary", redact(clip(body, 3000)), src, n),
+            )
+            n += 1
+    except sqlite3.OperationalError:
+        pass
+    con.commit()
+    print(f"claude-mem 이관 {n}건 (출처 agent='claude-mem')")
+
+
+def cmd_doctor(args):
+    cfg = load_config()
+    src = discover_sources(cfg)
+    by = {}
+    for a, _ in src:
+        by[a] = by.get(a, 0) + 1
+    print(f"timecapsule {VERSION} · home {TC_HOME}")
+    print(f"sources: " + ", ".join(f"{k} {v}" for k, v in by.items()) if by else "sources: 없음")
+    try:
+        con = connect()
+        print(f"db ok · tokenizer {tokenizer(con)} · sqlite {sqlite3.sqlite_version}")
+        n = con.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        f = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        print(f"entries {n} · files {f}")
+    except Exception as e:
+        print(f"db 오류: {e}")
+    cm = os.path.join(HOME, ".claude-mem", "claude-mem.db")
+    print(f"claude-mem db: {'있음' if os.path.exists(cm) else '없음'} ({cm})")
+
+
+# ---------------------------------------------------------------- main
+def build_parser():
+    p = argparse.ArgumentParser(prog="timecapsule", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("index", help="증분 색인")
+    a.add_argument("--quick", action="store_true", help="4초 예산 안에서 최신 파일부터")
+    a.add_argument("--timeout", type=float, help="초 단위 예산")
+    a.add_argument("--quiet", action="store_true")
+    a.set_defaults(fn=cmd_index)
+
+    a = sub.add_parser("recent", help="최근 세션 요약")
+    a.add_argument("--project", default=os.getcwd())
+    a.add_argument("--all", action="store_true", help="프로젝트 필터 없이")
+    a.add_argument("--limit", type=int, default=5)
+    a.add_argument("--days", type=int)
+    a.add_argument("--max-chars", type=int, default=3000)
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_recent)
+
+    a = sub.add_parser("search", help="전문 검색")
+    a.add_argument("query")
+    a.add_argument("--project")
+    a.add_argument("--agent", choices=["claude", "codex", "claude-mem", "markdown"])
+    a.add_argument("--role", choices=["user", "assistant", "tool", "observation", "summary", "note"])
+    a.add_argument("--days", type=int)
+    a.add_argument("--limit", type=int, default=20)
+    a.add_argument("--json", action="store_true")
+    a.add_argument("--src", action="store_true", help="원본 파일:줄 표시")
+    a.set_defaults(fn=cmd_search)
+
+    a = sub.add_parser("session", help="세션 타임라인")
+    a.add_argument("id")
+    a.add_argument("--width", type=int, default=300)
+    a.set_defaults(fn=cmd_session)
+
+    a = sub.add_parser("tools", help="도구 호출 집계")
+    a.add_argument("--session")
+    a.add_argument("--project", default=os.getcwd())
+    a.add_argument("--days", type=int)
+    a.add_argument("--limit", type=int, default=20)
+    a.add_argument("--commands", action="store_true", help="셸 명령 앞 두 토큰 집계도")
+    a.set_defaults(fn=cmd_tools)
+
+    a = sub.add_parser("stats", help="통계")
+    a.set_defaults(fn=cmd_stats)
+
+    a = sub.add_parser("migrate-claude-mem", help="claude-mem 관찰 이관")
+    a.add_argument("--db", default="~/.claude-mem/claude-mem.db")
+    a.add_argument("--force", action="store_true")
+    a.set_defaults(fn=cmd_migrate_claude_mem)
+
+    a = sub.add_parser("doctor", help="점검")
+    a.set_defaults(fn=cmd_doctor)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    hard = getattr(args, "timeout", None)
+    if hard:
+        def _alarm(signum, frame):
+            raise TimeoutError("budget")
+        signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(int(hard) + 2)
+    try:
+        args.fn(args)
+    except TimeoutError:
+        debug("timeout — partial result kept")
+    except BrokenPipeError:
+        pass
+    except Exception as e:
+        sys.stderr.write(f"timecapsule: {e.__class__.__name__}: {e}\n")
+        if os.environ.get("TIMECAPSULE_DEBUG"):
+            raise
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
