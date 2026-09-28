@@ -1,51 +1,106 @@
 #!/usr/bin/env python3
 """timecapsule — 에이전트 세션 기록을 로컬에서 색인·검색·주입하는 CLI.
 
-원천: Claude Code 세션(~/.claude/projects/*/*.jsonl) · Codex CLI 세션(~/.codex/sessions/**/*.jsonl)
-      · 마크다운 아카이브(선택). 데몬·외부 추론 없음. 표준 라이브러리만 쓴다.
+원천: Claude Code 세션(~/.claude/projects/*/*.jsonl) · Claude 데스크톱 Cowork 세션
+      · Codex CLI 세션(~/.codex/sessions/**/*.jsonl) · 마크다운 아카이브(선택).
+      데몬·외부 추론 없음. 표준 라이브러리만 쓴다(python 3.9+).
 
 명령:
-  timecapsule index [--quick] [--timeout N]      증분 색인 (파일별 바이트 오프셋 기억)
+  timecapsule index [--quick] [--timeout N]      증분 색인 (파일별 바이트 오프셋·줄 수 기억)
   timecapsule recent [--project P] [--limit N]   최근 세션 요약 (세션 시작 주입용)
-  timecapsule search "질의" [--project P] [--agent A] [--days N] [--limit N]
-  timecapsule session <id>                       한 세션의 타임라인
+  timecapsule search "질의" [--project P] [--agent A] [--days N] [--sort recent|rank]
+  timecapsule session <id> [--offset N] [--limit N]   한 세션의 타임라인
   timecapsule tools [--session ID | --project P --days N]   도구 호출 집계 (주 에이전트 기록만)
-  timecapsule stats                              색인 통계
+  timecapsule forget <id> [--yes]                한 세션을 색인에서 지운다 (원본 파일은 그대로)
+  timecapsule rebuild [--yes]                    원본이 남은 파일을 다시 색인 (원본 없는 기록은 보존)
+  timecapsule stats · doctor
   timecapsule migrate-claude-mem [--db PATH]     claude-mem 관찰 요약을 색인으로 이관
-  timecapsule doctor                             원천·DB·토크나이저 점검
+  timecapsule hook session-start|stop            Claude Code 훅 진입점 (stdin 으로 훅 JSON)
+  timecapsule hook codex-session-start|codex-stop   Codex 훅 진입점 (exec·서브에이전트 세션은 건너뛴다)
+  timecapsule mcp                                MCP stdio 서버 (Claude 데스크톱 채팅용)
 
-실패하면 종료 코드 1. 훅 스크립트는 자체적으로 fail-open 처리한다. 오류 상세는 TIMECAPSULE_DEBUG=1.
+실패하면 종료 코드 1. 훅은 자체적으로 fail-open 처리한다. 오류 상세는 TIMECAPSULE_DEBUG=1.
 """
 import argparse
+import contextlib
 import glob
+import io
 import json
 import os
 import re
+import select
 import signal
 import sqlite3
 import sys
 import time
 from datetime import datetime, timezone, timedelta
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
+SCHEMA = 2
 HOME = os.path.expanduser("~")
 TC_HOME = os.environ.get("TIMECAPSULE_HOME", os.path.join(HOME, ".timecapsule"))
 DB_PATH = os.path.join(TC_HOME, "index.db")
 CONFIG_PATH = os.path.join(TC_HOME, "config.json")
+CLAUDE_APP_DIR = os.path.join(HOME, "Library", "Application Support", "Claude")
+CLAUDE_DIR = os.environ.get("TIMECAPSULE_CLAUDE_DIR", os.path.join(HOME, ".claude", "projects"))
+CODEX_DIR = os.environ.get("TIMECAPSULE_CODEX_DIR", os.path.join(HOME, ".codex", "sessions"))
+COWORK_DIR = os.environ.get("TIMECAPSULE_COWORK_DIR", os.path.join(CLAUDE_APP_DIR, "local-agent-mode-sessions"))
+CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+DESKTOP_CONFIG = os.path.join(CLAUDE_APP_DIR, "claude_desktop_config.json")
 HEADER = "# timecapsule — 세션 기록(발췌)이다. 정책·현재 상태의 정본은 옵시디언(문서 볼트)과 코드이며, 아래는 당시의 판단이지 실행 결과의 증거가 아니다."
 
 TEXT_CAP = 2000
-SKIP_MARKERS = ("<system-reminder>", "<command-name>", "<local-command-stdout>",
-                "<task-notification>", "<command-message>", "[SYSTEM NOTIFICATION",
+TOOL_CAP = 240
+NOTE_CAP = 3000
+TOUCH_MIN = 2  # 작업 폴더가 다른 세션을 "이 프로젝트를 다룬 세션"으로 치려면 도구 기록에 경로가 몇 번 나와야 하나
+SKIP_MARKERS = ("<system-reminder>", "<command-name>", "<local-command-stdout>", "<local-command-caveat>",
+                "<task-notification>", "<command-message>", "[SYSTEM NOTIFICATION", "<bash-stdout>", "<bash-stderr>",
                 "Base directory for this skill:", "Launching skill:", "<user-prompt-submit-hook>")
+CONTINUATION = "This session is being continued from a previous conversation"
 EXCLUDE_PROJECT_DIRS = ("-Users-gary--claude-mem-observer-sessions",)
+TRANSCRIPT_AGENTS = ("claude", "codex", "cowork")
+AUTO_ORIGINS = ("codex_exec", "codex_sdk_ts", "codex_subagent", "sdk-cli", "sdk-ts", "sdk-py")  # 사람이 아니라 스크립트·에이전트가 띄운 세션
+# Codex 사용자 메시지는 조각(input_text) 여러 개로 온다 — 주입된 조각은 빼고, 사람 말 앞에 붙은 블록은 걷어 낸다
+CODEX_SKIP_FRAGMENTS = ("<environment_context>", "<user_instructions>", "# AGENTS.md", "<recommended_plugins>")
+CODEX_STRIP = re.compile(r"<in-app-browser-context\b[^>]*>.*?</in-app-browser-context>|</?image\b[^>]*>", re.S)
+CODEX_GUARDIAN = "The following is the Codex agent history"  # 검토 서브에이전트에 넘기는 기록 — 통째로 뺀다
+SELF_QUERY = ("timecapsule search", "timecapsule recent", "timecapsule session", "timecapsule tools")
 REDACT = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S), "••••private-key••••"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA••••"),
-    (re.compile(r"\b(sk|ghp|gho|ghs|ghu|xox[bpa]|pk|rk)[-_][A-Za-z0-9_\-]{16,}"), "••••token••••"),
-    (re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_\.=]{16,}"), "Bearer ••••"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}"), "AIza••••"),
+    (re.compile(r"\b(?:github_pat_|glpat-|npm_)[A-Za-z0-9_\-]{20,}"), "••••token••••"),
+    (re.compile(r"\b(sk|ghp|gho|ghs|ghu|ghr|xox[bpaers]|pk|rk)[-_][A-Za-z0-9_\-]{16,}"), "••••token••••"),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_\.=~+/]{16,}"), "Bearer ••••"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "••••jwt••••"),
-    (re.compile(r"(?i)(password|passwd|secret|api[_-]?key)\s*[=:]\s*\S{6,}"), r"\1=••••"),
+    (re.compile(r"(\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@'\"]+:)[^\s@/'\"]+@"), r"\1••••@"),
+    (re.compile(r"(?i)(authorization\s*[:=]\s*[\"']?basic)\s+[A-Za-z0-9+/=]{8,}"), r"\1 ••••"),
+    (re.compile(r"(\s-u\s+[\"']?[^\s:'\"]+:)[^\s'\"]+"), r"\1••••"),  # curl -u user:pass
 ]
+# 이름에 password·secret·token 등이 든 키 = 값. 키·값 모두 따옴표(\" 이스케이프 포함)가 있어도 된다 — JSON·셸·YAML 꼴
+KV_RX = re.compile(
+    r"(?i)(?P<kq>\\?[\"']?)(?P<key>[A-Za-z0-9_.\-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key"
+    r"|private[_-]?key|credential)[A-Za-z0-9_.\-]*)(?P=kq)(?P<sep>\s*[=:]\s*)"
+    r"(?:(?P<vq>\\?[\"'])(?P<qv>(?:(?!(?P=vq)).){3,})(?P=vq)|(?P<bv>[^\s\"'\\,;{}()\[\]]{6,}))")
+# 비밀이 아닌 키(개수·이름·경로 등)와 비밀이 아닌 값(자리표시자·타입 이름)은 살린다 — 검색에 쓰이는 설정값을 지우지 않게
+# 키는 소문자로 비교한다 — SecretId·secretName 같은 camelCase 도 구분자 없이 잡히게
+KV_KEEP_KEY = re.compile(r"tokens|tokenizer|token_?(?:count|type|usage|limit|budget|len|length|id|ids|index)\b"
+                         r"|[_.\-]?(?:id|ids|name|arn|ref|path|file|dir|type|count|policy|manager|store|prefix|url|uri"
+                         r"|rotation|version|length|len|limit|env|var|field)$")
+# 변수 참조는 대문자 환경변수 꼴만 살린다 — '$ecret123x' 같은 값이 변수로 오인돼 새지 않게
+KV_KEEP_VAL = re.compile(r"•.*|\$\{?[A-Z_][A-Z0-9_]*\}?|%[A-Z_][A-Z0-9_]*%|%\([a-z_]+\)s|<[^<>]+>|\{\{.*\}\}"
+                         r"|\*+|[xX]+|\.\.\.|…|(?i:null|none|true|false|undefined|required|optional(?:\[.*)?|str|string|int"
+                         r"|bool|bytes|secretstr|any|number|boolean)")
+
+
+def _kv_sub(m):
+    key = m.group("key")
+    quoted = m.group("vq") is not None
+    val = m.group("qv") if quoted else m.group("bv")
+    if KV_KEEP_KEY.search(key.lower()) or KV_KEEP_VAL.fullmatch(val.strip()):
+        return m.group(0)
+    head = m.group("kq") + key + m.group("kq") + m.group("sep")
+    return head + (m.group("vq") + "••••" + m.group("vq") if quoted else "••••")
 
 
 def debug(msg):
@@ -56,12 +111,17 @@ def debug(msg):
 def redact(text):
     for rx, rep in REDACT:
         text = rx.sub(rep, text)
-    return text
+    return KV_RX.sub(_kv_sub, text)
 
 
 def clip(text, n=TEXT_CAP):
     text = text.strip()
     return text if len(text) <= n else text[:n] + " …"
+
+
+def clean(text, role):
+    """비밀값을 먼저 가리고 자른다 — 잘린 토큰 조각이 가림 패턴을 빠져나가지 않게."""
+    return clip(redact(text), TOOL_CAP if role == "tool" else TEXT_CAP)
 
 
 def load_config():
@@ -74,45 +134,132 @@ def load_config():
     return cfg
 
 
+def since(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+class HardTimeout(BaseException):
+    """alarm 이 던진다. Exception 이 아니어야 파서의 except Exception 에 삼켜지지 않는다 — 삼켜지면 그 줄을 건너뛴 채
+    오프셋이 저장돼 다시 읽지 않는다. 트랜잭션은 롤백되고 다음 색인이 같은 자리부터 다시 읽는다."""
+
+
+@contextlib.contextmanager
+def alarm(seconds):
+    """seconds 뒤 HardTimeout. 한 줄이 아주 긴 파일에서도 훅이 제한 시간을 넘지 않게 하는 마지막 안전판."""
+    def _raise(signum, frame):
+        raise HardTimeout("budget")
+    old = signal.signal(signal.SIGALRM, _raise)
+    signal.alarm(max(1, int(seconds)))
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
 # ---------------------------------------------------------------- DB
-def connect():
-    os.makedirs(TC_HOME, exist_ok=True)
-    con = sqlite3.connect(DB_PATH, timeout=5)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA synchronous=NORMAL")
-    con.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS files(
-          path TEXT PRIMARY KEY, offset INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0,
-          mtime REAL NOT NULL DEFAULT 0, agent TEXT, session_id TEXT, project TEXT, indexed_at REAL);
-        CREATE TABLE IF NOT EXISTS entries(
-          id INTEGER PRIMARY KEY, agent TEXT NOT NULL, project TEXT, session_id TEXT NOT NULL,
-          ts TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, path TEXT, line INTEGER);
-        CREATE INDEX IF NOT EXISTS ix_entries_session ON entries(session_id, ts);
-        CREATE INDEX IF NOT EXISTS ix_entries_project_ts ON entries(project, ts);
-        CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
-        """
-    )
-    tok = con.execute("SELECT v FROM meta WHERE k='tokenizer'").fetchone()
-    if not tok:
-        tokenizer = "trigram"
+class Tx:
+    """BEGIN IMMEDIATE … COMMIT. 오프셋을 읽을 때부터 쓰기 잠금을 잡아, 동시에 도는 색인이 같은 줄을 두 번 넣지 못하게 한다."""
+
+    def __init__(self, con):
+        self.con = con
+
+    def __enter__(self):
+        self.con.execute("BEGIN IMMEDIATE")
+        return self.con
+
+    def __exit__(self, et, ev, tb):
+        if et is None:
+            self.con.execute("COMMIT")
+        else:
+            try:
+                self.con.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        return False
+
+
+def secure_paths():
+    """색인은 원본 세션 기록(0600)의 사본이다 — 같은 맥의 다른 계정이 읽지 못하게 폴더 0700·파일 0600 으로 맞춘다."""
+    for path, mode in [(TC_HOME, 0o700)] + [(p, 0o600) for p in [DB_PATH, DB_PATH + "-wal", DB_PATH + "-shm"]
+                                            + glob.glob(DB_PATH + ".bak-*")]:
         try:
-            con.execute("CREATE VIRTUAL TABLE fts USING fts5(text, content='entries', content_rowid='id', tokenize='trigram')")
-        except sqlite3.OperationalError:
-            tokenizer = "unicode61"
-            con.execute("CREATE VIRTUAL TABLE fts USING fts5(text, content='entries', content_rowid='id', tokenize='unicode61')")
-        con.executescript(
-            """
-            CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
-              INSERT INTO fts(rowid, text) VALUES (new.id, new.text); END;
-            CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
-              INSERT INTO fts(fts, rowid, text) VALUES('delete', old.id, old.text); END;
-            """
-        )
-        con.execute("INSERT INTO meta(k,v) VALUES('tokenizer',?)", (tokenizer,))
-        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('schema','1')")
-        con.commit()
+            if os.path.exists(path) and (os.stat(path).st_mode & 0o777) != mode:
+                os.chmod(path, mode)
+        except OSError as e:
+            debug(f"chmod {path}: {e}")
+
+
+def connect(timeout=10.0):
+    os.makedirs(TC_HOME, mode=0o700, exist_ok=True)
+    con = sqlite3.connect(DB_PATH, timeout=timeout, isolation_level=None)
+    # 새 DB 를 여러 프로세스가 동시에 WAL 로 바꾸면 busy timeout 을 기다리지 않고 바로 locked 가 난다 → 필요할 때만, 재시도하며
+    for _ in range(int(timeout * 10) + 1):
+        try:
+            if con.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                con.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e):
+                raise
+            time.sleep(0.1)
+    con.execute("PRAGMA synchronous=NORMAL")
+    if schema_version(con) < SCHEMA:
+        migrate(con)
+    secure_paths()
     return con
+
+
+def schema_version(con):
+    try:
+        row = con.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return int(row[0]) if row else 0
+
+
+def migrate(con):
+    """빈 DB·v1 → v2. 두 프로세스가 동시에 올려도 한쪽만 적용되게 잠금 안에서 다시 확인한다."""
+    with Tx(con):
+        con.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, offset INTEGER NOT NULL DEFAULT 0,"
+                    " size INTEGER NOT NULL DEFAULT 0, mtime REAL NOT NULL DEFAULT 0, agent TEXT, session_id TEXT,"
+                    " project TEXT, indexed_at REAL)")
+        con.execute("CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, project TEXT,"
+                    " session_id TEXT NOT NULL, ts TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, path TEXT, line INTEGER)")
+        con.execute("CREATE INDEX IF NOT EXISTS ix_entries_session ON entries(session_id, ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS ix_entries_project_ts ON entries(project, ts)")
+        con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        if schema_version(con) >= SCHEMA:
+            return
+        if not con.execute("SELECT v FROM meta WHERE k='tokenizer'").fetchone():
+            tok = "trigram"
+            try:
+                con.execute("CREATE VIRTUAL TABLE fts USING fts5(text, content='entries', content_rowid='id', tokenize='trigram')")
+            except sqlite3.OperationalError:
+                tok = "unicode61"
+                con.execute("CREATE VIRTUAL TABLE fts USING fts5(text, content='entries', content_rowid='id', tokenize='unicode61')")
+            con.execute("INSERT INTO meta(k,v) VALUES('tokenizer',?)", (tok,))
+        con.execute("CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN"
+                    " INSERT INTO fts(rowid, text) VALUES (new.id, new.text); END")
+        con.execute("CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN"
+                    " INSERT INTO fts(fts, rowid, text) VALUES('delete', old.id, old.text); END")
+        con.execute("CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE OF text ON entries BEGIN"
+                    " INSERT INTO fts(fts, rowid, text) VALUES('delete', old.id, old.text);"
+                    " INSERT INTO fts(rowid, text) VALUES (new.id, new.text); END")
+        cols = {r[1] for r in con.execute("PRAGMA table_info(files)")}
+        if "lines" not in cols:  # NULL = 아직 모름 → 다음 색인 때 오프셋까지의 줄 수를 센다
+            con.execute("ALTER TABLE files ADD COLUMN lines INTEGER")
+        if "forgotten" not in cols:
+            con.execute("ALTER TABLE files ADD COLUMN forgotten INTEGER NOT NULL DEFAULT 0")
+        con.execute("CREATE TABLE IF NOT EXISTS sessions(session_id TEXT PRIMARY KEY, agent TEXT, origin TEXT, title TEXT)")
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('schema',?)", (str(SCHEMA),))
 
 
 def tokenizer(con):
@@ -134,38 +281,44 @@ def claude_text(content):
 
 
 def parse_claude_line(o, state):
-    """한 줄 → (role, text) 또는 None. state 에 cwd·session 을 누적한다."""
+    """한 줄 → [(role, text), …] 또는 None. state 에 cwd·session·entrypoint 를 누적한다."""
     if o.get("cwd") and not state.get("project"):
         state["project"] = o["cwd"]
     if o.get("sessionId") and not state.get("session_id"):
         state["session_id"] = o["sessionId"]
-    t = o.get("type")
+    if o.get("entrypoint") and not state.get("origin"):
+        state["origin"] = o["entrypoint"]
     if o.get("isSidechain"):
         return None
+    t = o.get("type")
     if t == "user":
         m = o.get("message") or {}
         text = claude_text(m.get("content"))
-        if not text or any(mk in text for mk in SKIP_MARKERS):
+        if not text.strip():
             return None
-        if o.get("toolDenialKind"):
+        if o.get("isCompactSummary"):
+            return [("summary", text)]
+        if o.get("isMeta") or o.get("toolDenialKind") or any(mk in text for mk in SKIP_MARKERS):
             return None
-        return ("user", clip(text))
+        return [("user", text)]
     if t == "assistant":
         m = o.get("message") or {}
         out = []
         for c in (m.get("content") or []):
             if not isinstance(c, dict):
                 continue
-            if c.get("type") == "text" and c.get("text", "").strip():
-                out.append(("assistant", clip(c["text"])))
+            if c.get("type") == "text" and str(c.get("text", "")).strip():
+                out.append(("assistant", str(c["text"])))
             elif c.get("type") == "tool_use":
                 name = c.get("name", "?")
                 inp = c.get("input") or {}
                 detail = ""
                 if name == "Bash":
-                    detail = str(inp.get("command", "")).strip().split("\n")[0][:200]
-                elif name in ("Read", "Edit", "Write", "MultiEdit"):
-                    detail = str(inp.get("file_path", ""))[:200]
+                    detail = str(inp.get("command", "")).strip().split("\n")[0]
+                elif name in ("Read", "Edit", "Write", "MultiEdit", "NotebookEdit"):
+                    detail = str(inp.get("file_path") or inp.get("notebook_path") or "")
+                elif name in ("Grep", "Glob"):
+                    detail = f"{inp.get('pattern', '')} {inp.get('path', '')}".strip()
                 elif name == "Skill":
                     detail = str(inp.get("skill", ""))
                 elif name == "Agent":
@@ -175,13 +328,23 @@ def parse_claude_line(o, state):
     return None
 
 
+def codex_origin(meta):
+    """session_meta → origin. 서브에이전트·exec 는 사람이 연 세션이 아니다."""
+    src = meta.get("source")
+    if isinstance(src, dict) and "subagent" in src:
+        return "codex_subagent"
+    if src == "exec":
+        return "codex_exec"
+    return meta.get("originator")
+
+
 def parse_codex_line(o, state):
     t = o.get("type")
     p = o.get("payload") or {}
     if t == "session_meta":
         state["project"] = p.get("cwd") or state.get("project")
         state["session_id"] = p.get("id") or state.get("session_id")
-        state["originator"] = p.get("originator")
+        state["origin"] = codex_origin(p) or state.get("origin")
         return None
     if t == "turn_context" and p.get("cwd") and not state.get("project"):
         state["project"] = p["cwd"]
@@ -194,14 +357,22 @@ def parse_codex_line(o, state):
                 return None
             parts = []
             for c in (p.get("content") or []):
-                if isinstance(c, dict) and c.get("type") in ("input_text", "output_text"):
-                    parts.append(str(c.get("text", "")))
+                if not (isinstance(c, dict) and c.get("type") in ("input_text", "output_text")):
+                    continue
+                frag = str(c.get("text", ""))
+                if role == "user":
+                    head = frag.lstrip()
+                    if head.startswith(CODEX_GUARDIAN):
+                        return None
+                    if head.startswith(CODEX_SKIP_FRAGMENTS):
+                        continue
+                    frag = CODEX_STRIP.sub("", frag)
+                if frag.strip():
+                    parts.append(frag.strip())
             text = "\n".join(parts)
-            if not text.strip():
+            if not text:
                 return None
-            if role == "user" and text.lstrip().startswith(("<environment_context>", "<user_instructions>", "# AGENTS.md")):
-                return None
-            return (role, clip(text))
+            return [(role, text)]
         if pt in ("function_call", "custom_tool_call", "local_shell_call"):
             name = p.get("name") or pt
             args = p.get("arguments") or p.get("input") or ""
@@ -215,11 +386,12 @@ def parse_codex_line(o, state):
                         args = m.group(1).encode().decode("unicode_escape", "ignore")
             if isinstance(args, list):
                 args = " ".join(map(str, args))
-            return ("tool", clip(f"{name} {str(args).strip().splitlines()[0] if str(args).strip() else ''}", 240))
+            first = str(args).strip().splitlines()[0] if str(args).strip() else ""
+            return [("tool", f"{name} {first}".strip())]
     return None
 
 
-def line_ts(o, agent, fallback):
+def line_ts(o, fallback):
     ts = o.get("timestamp")
     if isinstance(ts, str) and ts:
         return ts
@@ -239,79 +411,157 @@ def discover_sources(cfg):
     """(agent, path) 목록. 최신 수정 순."""
     out = []
     excl = set(cfg.get("exclude_project_dirs") or [])
-    for d in glob.glob(os.path.join(HOME, ".claude", "projects", "*")):
+    for d in glob.glob(os.path.join(CLAUDE_DIR, "*")):
         if os.path.basename(d) in excl:
             continue
         for f in glob.glob(os.path.join(d, "*.jsonl")):
             out.append(("claude", f))
-    for f in glob.glob(os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl"), recursive=True):
+    for f in glob.glob(os.path.join(CODEX_DIR, "**", "*.jsonl"), recursive=True):
         out.append(("codex", f))
+    # Cowork(데스크톱 로컬 에이전트): <계정>/<조직>/local_<id>/.claude/projects/<vm-cwd>/<uuid>.jsonl — audit.jsonl·subagents 는 뺀다
+    for f in glob.glob(os.path.join(COWORK_DIR, "*", "*", "local_*", ".claude", "projects", "*", "*.jsonl")):
+        out.append(("cowork", f))
     for d in cfg.get("extra_markdown_dirs") or []:
         for f in glob.glob(os.path.join(os.path.expanduser(d), "**", "*.md"), recursive=True):
             out.append(("markdown", f))
-    out.sort(key=lambda ap: os.path.getmtime(ap[1]) if os.path.exists(ap[1]) else 0, reverse=True)
+
+    def mtime(ap):
+        try:
+            return os.path.getmtime(ap[1])
+        except OSError:
+            return 0
+    out.sort(key=mtime, reverse=True)
     return out
 
 
-def index_file(con, agent, path, budget):
-    """한 파일을 기억된 오프셋부터 읽어 새 줄만 넣는다. 불완전한 마지막 줄은 다음에 다시 읽는다."""
+def cowork_meta(path):
+    """Cowork 세션 파일 옆의 local_<id>.json 에서 제목과 사용자가 고른 폴더(→ 프로젝트)를 읽는다."""
+    local = path
+    for _ in range(4):
+        local = os.path.dirname(local)
+    try:
+        with open(local + ".json", encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except Exception:
+        return {}
+    out = {"title": meta.get("title") or None}
+    for f in meta.get("userSelectedFolders") or []:
+        p = f if isinstance(f, str) else (f.get("path") if isinstance(f, dict) else None)
+        if p:
+            out["project"] = p.rstrip("/") or "/"
+            break
+    return out
+
+
+def count_newlines(path, upto):
+    n = 0
+    with open(path, "rb") as fh:
+        left = upto
+        while left > 0:
+            b = fh.read(min(left, 1 << 20))
+            if not b:
+                break
+            n += b.count(b"\n")
+            left -= len(b)
+    return n
+
+
+def unchanged(size, mtime, st):
+    return size == st.st_size and abs(mtime - st.st_mtime) < 1e-6
+
+
+FILES_UPSERT = (
+    "INSERT INTO files(path, offset, size, mtime, agent, session_id, project, indexed_at, lines) VALUES(?,?,?,?,?,?,?,?,?)"
+    " ON CONFLICT(path) DO UPDATE SET offset=excluded.offset, size=excluded.size, mtime=excluded.mtime, agent=excluded.agent,"
+    " session_id=excluded.session_id, project=excluded.project, indexed_at=excluded.indexed_at, lines=excluded.lines"
+)
+
+
+def index_file(con, agent, path, budget, reset=False):
+    """한 파일을 기억된 오프셋부터 읽어 새 줄만 넣는다. reset 이면 그 파일의 항목을 지우고 처음부터."""
     try:
         st = os.stat(path)
-    except FileNotFoundError:
+    except OSError:
         return 0
-    row = con.execute("SELECT offset, size, mtime, session_id, project FROM files WHERE path=?", (path,)).fetchone()
+    if not reset:  # 잠금 없이 빠르게 걸러낸다 — 대부분의 파일은 여기서 끝난다
+        row = con.execute("SELECT size, mtime, forgotten FROM files WHERE path=?", (path,)).fetchone()
+        if row and (row[2] or unchanged(row[0], row[1], st)):
+            return 0
+    with Tx(con):
+        if reset:
+            con.execute("DELETE FROM entries WHERE path=?", (path,))
+            con.execute("UPDATE files SET offset=0, size=0, mtime=0, lines=0, session_id=NULL, project=NULL"
+                        " WHERE path=? AND forgotten=0", (path,))
+        row = con.execute("SELECT offset, size, mtime, session_id, project, lines, forgotten FROM files WHERE path=?",
+                          (path,)).fetchone()
+        if row and (row[6] or unchanged(row[1], row[2], st)):
+            return 0
+        if agent == "markdown":
+            return index_markdown(con, path, st)
+        return index_lines(con, agent, path, st, row, budget)
+
+
+def index_lines(con, agent, path, st, row, budget):
     offset = row[0] if row else 0
-    if row and row[1] == st.st_size and abs(row[2] - st.st_mtime) < 1e-6:
-        return 0
+    lines = row[5] if row else 0
+    state = {"session_id": row[3] if row else None, "project": row[4] if row else None}
     if st.st_size < offset:  # 잘렸거나 다시 쓰인 파일 → 처음부터
         con.execute("DELETE FROM entries WHERE path=?", (path,))
-        offset = 0
-    state = {"session_id": row[3] if row else None, "project": row[4] if row else None}
-    if agent == "markdown":
-        return index_markdown(con, path, st)
+        offset, lines = 0, 0
+        state = {"session_id": None, "project": None}
+    if lines is None:  # v1 에서 넘어온 파일 — 오프셋까지의 줄 수를 센다
+        lines = count_newlines(path, offset)
+    if agent == "cowork":
+        meta = cowork_meta(path)
+        state["origin"] = "cowork"
+        state["title"] = meta.get("title")
+        if meta.get("project") and not state.get("project"):
+            state["project"] = meta["project"]
+    parse = parse_codex_line if agent == "codex" else parse_claude_line
+    fallback_ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
     added = 0
-    file_fallback_ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
     with open(path, "rb") as fh:
         fh.seek(offset)
-        line_no = 0
-        while True:
+        while not budget.over():
             pos = fh.tell()
             raw = fh.readline()
             if not raw:
                 break
-            if not raw.endswith(b"\n"):
-                # 아직 쓰는 중인 마지막 줄 — 다음 색인에 재처리
+            if not raw.endswith(b"\n"):  # 아직 쓰는 중인 마지막 줄 — 다음 색인에 재처리
                 fh.seek(pos)
                 break
-            line_no += 1
+            lines += 1
             try:
                 o = json.loads(raw.decode("utf-8", "ignore"))
             except Exception:
                 continue
-            parsed = parse_claude_line(o, state) if agent == "claude" else parse_codex_line(o, state)
-            if not parsed:
+            if not isinstance(o, dict):
+                continue
+            items = parse(o, state)
+            if not items:
                 continue
             sid = state.get("session_id") or os.path.splitext(os.path.basename(path))[0]
-            ts = line_ts(o, agent, file_fallback_ts)
-            items = parsed if isinstance(parsed, list) else [parsed]
+            ts = line_ts(o, fallback_ts)
             for role, text in items:
-                text = redact(text)
                 con.execute(
                     "INSERT INTO entries(agent, project, session_id, ts, role, text, path, line) VALUES(?,?,?,?,?,?,?,?)",
-                    (agent, state.get("project"), sid, ts, role, text, path, line_no),
+                    (agent, state.get("project"), sid, ts, role, clean(text, role), path, lines),
                 )
                 added += 1
-            if budget.over():
-                break
         new_offset = fh.tell()
-    con.execute(
-        "INSERT OR REPLACE INTO files(path, offset, size, mtime, agent, session_id, project, indexed_at) VALUES(?,?,?,?,?,?,?,?)",
-        (path, new_offset, st.st_size if new_offset >= st.st_size else new_offset, st.st_mtime if new_offset >= st.st_size else 0,
-         agent, state.get("session_id"), state.get("project"), time.time()),
-    )
+    done = new_offset >= st.st_size
+    con.execute(FILES_UPSERT, (path, new_offset, st.st_size if done else new_offset, st.st_mtime if done else 0,
+                               agent, state.get("session_id"), state.get("project"), time.time(), lines))
     # 프로젝트가 늦게 확정된 경우 앞 항목 보정
     if state.get("project"):
         con.execute("UPDATE entries SET project=? WHERE path=? AND project IS NULL", (state["project"], path))
+    sid = state.get("session_id")
+    if sid and (state.get("origin") or state.get("title")):
+        con.execute(
+            "INSERT INTO sessions(session_id, agent, origin, title) VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET"
+            " origin=COALESCE(excluded.origin, sessions.origin), title=COALESCE(excluded.title, sessions.title)",
+            (sid, agent, state.get("origin"), state.get("title")),
+        )
     return added
 
 
@@ -324,187 +574,363 @@ def index_markdown(con, path, st):
     if m:
         ts = m.group(1) + "T00:00:00+00:00"
     sid = "md:" + os.path.relpath(path, HOME)
-    chunks = re.split(r"\n(?=#{1,3} )", text)
     n = 0
-    for i, ch in enumerate(chunks):
+    for i, ch in enumerate(re.split(r"\n(?=#{1,3} )", text)):
         ch = ch.strip()
         if len(ch) < 40:
             continue
         con.execute(
             "INSERT INTO entries(agent, project, session_id, ts, role, text, path, line) VALUES(?,?,?,?,?,?,?,?)",
-            ("markdown", os.path.dirname(path), sid, ts, "note", redact(clip(ch, 3000)), path, i),
+            ("markdown", os.path.dirname(path), sid, ts, "note", clip(redact(ch), NOTE_CAP), path, i),
         )
         n += 1
-    con.execute(
-        "INSERT OR REPLACE INTO files(path, offset, size, mtime, agent, session_id, project, indexed_at) VALUES(?,?,?,?,?,?,?,?)",
-        (path, st.st_size, st.st_size, st.st_mtime, "markdown", sid, os.path.dirname(path), time.time()),
-    )
+    con.execute(FILES_UPSERT, (path, st.st_size, st.st_size, st.st_mtime, "markdown", sid, os.path.dirname(path),
+                               time.time(), 0))
     return n
 
 
-def cmd_index(args):
-    cfg = load_config()
-    con = connect()
-    budget = Budget(args.timeout if args.timeout else (4 if args.quick else None))
-    total = 0
-    files = 0
-    for agent, path in discover_sources(cfg):
+def run_index(con, budget):
+    total = files = 0
+    for agent, path in discover_sources(load_config()):
         if budget.over():
             break
         n = index_file(con, agent, path, budget)
         if n:
             total += n
             files += 1
-        if files % 20 == 0:
-            con.commit()
     con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_index', ?)", (datetime.now(timezone.utc).isoformat(),))
-    con.commit()
+    return total, files
+
+
+def auto_index(seconds=2.0):
+    """조회 전에 짧게 색인한다 — 훅이 없는 쪽(Codex·데스크톱 MCP)도 최신 기록을 보게. 잠겨 있으면 건너뛴다."""
+    if os.environ.get("TIMECAPSULE_NO_AUTO_INDEX"):
+        return
+    try:
+        con = connect(timeout=1.0)
+        try:
+            run_index(con, Budget(seconds))
+        finally:
+            con.close()
+    except Exception as e:
+        debug(f"auto-index skipped: {e.__class__.__name__}: {e}")
+
+
+def cmd_index(args):
+    con = connect()
+    budget = Budget(args.timeout if args.timeout else (4 if args.quick else None))
+    total, files = run_index(con, budget)
     if not args.quiet:
         print(f"indexed {total} entries from {files} files" + (" (budget hit)" if budget.over() else ""))
 
 
-# ---------------------------------------------------------------- 조회
-def project_filter_sql(project):
-    """현재 경로와 세션 cwd 가 서로 접두어 관계면 같은 프로젝트로 본다(워크트리·하위 저장소 포함)."""
+# ---------------------------------------------------------------- 프로젝트 범위
+def norm_project(p):
+    return os.path.abspath(os.path.expanduser(p)).rstrip("/") or "/"
+
+
+def in_cwd(project, p):
+    return bool(project) and (project == p or project.startswith(p + "/"))
+
+
+def touched_sessions(con, p):
+    """작업 폴더가 달라도 도구 호출(파일 경로·명령)에 이 경로를 TOUCH_MIN 번 이상 남긴 세션 → {session_id: 횟수}."""
+    if p == "/" or p == HOME or HOME.startswith(p + "/"):
+        return {}
+    needles = [p]
+    if p.startswith(HOME + "/"):
+        needles.append("~" + p[len(HOME):])
+    rx = re.compile("(?:" + "|".join(re.escape(n) for n in needles) + r")(?![\w.\-])")  # /app 이 /app2·/app-x 에 걸리지 않게
+    sql = ("SELECT session_id, text FROM entries WHERE role='tool' AND ("
+           + " OR ".join(["instr(text, ?) > 0"] * len(needles)) + ")")
+    counts = {}
+    for sid, text in con.execute(sql, needles):
+        if rx.search(text):
+            counts[sid] = counts.get(sid, 0) + 1
+    return {s: n for s, n in counts.items() if n >= TOUCH_MIN}
+
+
+def scope_sql(con, project, touched=True, a="e."):
+    """프로젝트 범위 조건 → (where, params, 경로를 다룬 세션 맵).
+
+    같은 프로젝트로 보는 것: 세션 cwd 가 P 이거나 P 의 하위 · 도구 기록에 P 를 TOUCH_MIN 번 이상 남긴 세션
+    · claude-mem 이관분 중 프로젝트 이름이 P 의 폴더 이름과 같은 것. 상위 폴더(홈 포함)에서 연 세션은 넣지 않는다.
+    """
     if not project:
-        return "1=1", ()
-    p = os.path.abspath(os.path.expanduser(project)).rstrip("/")
-    return "(project = ? OR project LIKE ? OR ? LIKE project || '/%')", (p, p + "/%", p)
+        return "1=1", (), {}
+    p = norm_project(project)
+    if p == "/":
+        return "1=1", (), {}
+    parts = [f"{a}project = ?", f"substr({a}project, 1, ?) = ?", f"({a}agent = 'claude-mem' AND {a}project = ?)"]
+    params = [p, len(p) + 1, p + "/", os.path.basename(p)]
+    tmap = touched_sessions(con, p) if touched else {}
+    if tmap:
+        parts.append(f"{a}session_id IN (SELECT value FROM json_each(?))")
+        params.append(json.dumps(sorted(tmap)))
+    return "(" + " OR ".join(parts) + ")", tuple(params), tmap
 
 
+def excluded_session(args):
+    """지금 이 세션은 결과에서 뺀다 — 자기 발화·자기 검색 명령이 과거 기록을 밀어내지 않게."""
+    if getattr(args, "include_current", False):
+        return None
+    return getattr(args, "exclude_session", None) or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+
+def session_meta(con, sids):
+    if not sids:
+        return {}
+    rows = con.execute("SELECT session_id, origin, title FROM sessions WHERE session_id IN (SELECT value FROM json_each(?))",
+                       (json.dumps(list(sids)),))
+    return {s: (o, t) for s, o, t in rows}
+
+
+# ---------------------------------------------------------------- 조회
 def fmt_ts(ts):
     try:
         d = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
         return d.strftime("%m-%d %H:%M")
     except Exception:
-        return ts[:16]
+        return (ts or "")[:16]
 
 
 def short_project(p):
     if not p:
         return "-"
-    return p.replace(HOME, "~")
+    if p == HOME or p.startswith(HOME + "/"):
+        return "~" + p[len(HOME):]
+    return p
 
 
-def fts_query(q, tok):
-    terms = [t for t in re.split(r"\s+", q.strip()) if t]
-    if tok == "trigram":
-        terms = [t for t in terms if len(t) >= 3] or terms
-    return " AND ".join('"' + t.replace('"', '""') + '"' for t in terms)
+def src_ref(path, line):
+    if not path:
+        return "-"
+    if not os.path.exists(path):
+        return f"{short_project(path)} (원본 없음)"
+    return f"{short_project(path)}:{line}" if line else short_project(path)
+
+
+def make_snippet(text, terms, width=60):
+    flat = " ".join(text.split())
+    low = flat.lower()
+    hits = [(low.find(t.lower()), t) for t in terms]
+    hits = [h for h in hits if h[0] >= 0]
+    if not hits:
+        return flat[: width * 2]
+    pos = min(h[0] for h in hits)
+    start, end = max(0, pos - width), min(len(flat), pos + width)
+    seg = flat[start:end]
+    alts = "|".join(re.escape(t) for t in sorted({t for _, t in hits}, key=len, reverse=True))
+    seg = re.sub(alts, lambda m: "[" + m.group(0) + "]", seg, flags=re.I)
+    return ("…" if start > 0 else "") + seg + ("…" if end < len(flat) else "")
 
 
 def cmd_search(args):
+    if not args.no_index:
+        auto_index()
     con = connect()
     tok = tokenizer(con)
-    q = fts_query(args.query, tok)
-    where, params = project_filter_sql(args.project)
-    sql = (
-        "SELECT e.ts, e.agent, e.project, e.session_id, e.role, snippet(fts, 0, '[', ']', '…', 64), e.path, e.line "
-        "FROM fts JOIN entries e ON e.id = fts.rowid WHERE fts MATCH ? AND " + where
-    )
-    params = (q,) + params
+    terms = [t for t in args.query.split() if t]
+    if not terms:
+        raise ValueError("질의가 비었다")
+    # trigram 은 3글자 미만을 못 찾는다 → 짧은 단어는 본문 부분 일치로 거른다(한국어 2글자 단어: 배포·오류·훅)
+    if tok == "trigram":
+        long_t = [t for t in terms if len(t) >= 3]
+        short_t = [t for t in terms if len(t) < 3]
+    else:
+        long_t, short_t = terms, []
+    params = []
+    if long_t:
+        frm = " FROM fts JOIN entries e ON e.id = fts.rowid WHERE fts MATCH ?"
+        params.append(" AND ".join('"' + t.replace('"', '""') + '"' for t in long_t))
+        snip = "snippet(fts, 0, '[', ']', '…', 64)"
+    else:
+        frm = " FROM entries e WHERE 1=1"
+        snip = "NULL"
+    where = ""
+    for t in short_t:
+        where += " AND instr(lower(e.text), ?) > 0"
+        params.append(t.lower())
+    sw, sp, _ = scope_sql(con, args.project)
+    where += " AND " + sw
+    params += list(sp)
     if args.agent:
-        sql += " AND e.agent = ?"
-        params += (args.agent,)
-    if args.days:
-        since = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
-        sql += " AND e.ts >= ?"
-        params += (since,)
+        where += " AND e.agent = ?"
+        params.append(args.agent)
     if args.role:
-        sql += " AND e.role = ?"
-        params += (args.role,)
-    sql += " ORDER BY e.ts DESC LIMIT ?"
-    params += (args.limit,)
-    rows = con.execute(sql, params).fetchall()
+        where += " AND e.role = ?"
+        params.append(args.role)
+    if args.days:
+        where += " AND e.ts >= ?"
+        params.append(since(args.days))
+    cur = excluded_session(args)
+    if cur:
+        where += " AND e.session_id != ?"
+        params.append(cur)
+    # 과거에 돌린 timecapsule 검색 명령 자체가 결과를 채우지 않게
+    where += " AND NOT (e.role = 'tool' AND (" + " OR ".join(["instr(e.text, ?) > 0"] * len(SELF_QUERY)) + "))"
+    params += list(SELF_QUERY)
+    order = "bm25(fts), e.ts DESC" if (args.sort == "rank" and long_t) else "e.ts DESC"
+    cap = max(args.limit * 25, 500) if args.per_session else args.limit
+    sql = ("SELECT e.ts, e.agent, e.project, e.session_id, e.role, " + snip + ", e.path, e.line, e.text"
+           + frm + where + " ORDER BY " + order + " LIMIT ?")
+    rows, per = [], {}
+    for r in con.execute(sql, params + [cap]):
+        if args.per_session and per.get(r[3], 0) >= args.per_session:
+            continue
+        per[r[3]] = per.get(r[3], 0) + 1
+        rows.append(r)
+        if len(rows) >= args.limit:
+            break
+    out = []
+    for ts, agent, project, sid, role, snippet, path, line, text in rows:
+        s = snippet if (snippet and not short_t) else make_snippet(text, short_t + long_t)
+        out.append((ts, agent, project, sid, role, " ".join(s.split()), path, line))
     if args.json:
-        print(json.dumps([dict(ts=r[0], agent=r[1], project=r[2], session=r[3], role=r[4], snippet=r[5], path=r[6], line=r[7]) for r in rows], ensure_ascii=False))
+        print(json.dumps([dict(ts=r[0], agent=r[1], project=r[2], session=r[3], role=r[4], snippet=r[5], path=r[6], line=r[7])
+                          for r in out], ensure_ascii=False))
         return
     print(HEADER)
-    if not rows:
+    if not out:
         print(f"(결과 없음: {args.query!r})")
         return
-    for ts, agent, project, sid, role, snip, path, line in rows:
-        snip = " ".join(snip.split())
+    for ts, agent, project, sid, role, snip, path, line in out:
         print(f"[{fmt_ts(ts)}] {agent} · {short_project(project)} · {role} · {sid[:8]}\n    {snip}")
         if args.src:
-            print(f"    ↳ {short_project(path)}:{line}")
-
-
-def session_rows(con, where, params, limit):
-    sql = (
-        "SELECT session_id, agent, project, MIN(ts), MAX(ts), COUNT(*),"
-        " SUM(role='tool') FROM entries WHERE " + where + " AND agent != 'markdown'"
-        " GROUP BY session_id ORDER BY MAX(ts) DESC LIMIT ?"
-    )
-    return con.execute(sql, params + (limit,)).fetchall()
+            print(f"    ↳ {src_ref(path, line)}")
 
 
 def first_last(con, sid):
     fu = con.execute("SELECT text FROM entries WHERE session_id=? AND role='user' ORDER BY ts, id LIMIT 1", (sid,)).fetchone()
-    la = con.execute("SELECT text FROM entries WHERE session_id=? AND role='assistant' ORDER BY ts DESC, id DESC LIMIT 1", (sid,)).fetchone()
+    la = con.execute("SELECT text FROM entries WHERE session_id=? AND role='assistant' ORDER BY ts DESC, id DESC LIMIT 1",
+                     (sid,)).fetchone()
     return (fu[0] if fu else ""), (la[0] if la else "")
 
 
 def cmd_recent(args):
+    if not args.no_index:
+        auto_index()
     con = connect()
-    where, params = project_filter_sql(None if args.all else args.project)
+    project = None if args.all else args.project
+    where, params, tmap = scope_sql(con, project)
+    params = list(params)
+    where += " AND e.agent NOT IN ('markdown', 'claude-mem')"
     if args.days:
-        since = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
-        where += " AND ts >= ?"
-        params += (since,)
-    rows = session_rows(con, where, params, args.limit)
+        where += " AND e.ts >= ?"
+        params.append(since(args.days))
+    if not args.include_auto:
+        where += (" AND e.session_id NOT IN (SELECT session_id FROM sessions WHERE origin IN ("
+                  + ",".join("?" * len(AUTO_ORIGINS)) + "))")
+        params += list(AUTO_ORIGINS)
+    cur = excluded_session(args)
+    if cur:
+        where += " AND e.session_id != ?"
+        params.append(cur)
+    sql = ("SELECT e.session_id, MAX(e.agent), MAX(e.project), MIN(e.ts), MAX(e.ts), COUNT(*), SUM(e.role='tool')"
+           " FROM entries e WHERE " + where + " GROUP BY e.session_id HAVING SUM(e.role='user') > 0"
+           " ORDER BY MAX(e.ts) DESC LIMIT ?")
+    rows = con.execute(sql, params + [args.limit]).fetchall()
+    meta = session_meta(con, [r[0] for r in rows])
+    p = norm_project(project) if project else None
+
+    def touch_note(sid, proj):
+        if p and sid in tmap and not in_cwd(proj, p):
+            return tmap[sid]
+        return 0
+
     if args.json:
         out = []
-        for sid, agent, project, t0, t1, n, ntool in rows:
+        for sid, agent, proj, t0, t1, n, ntool in rows:
             fu, la = first_last(con, sid)
-            out.append(dict(session=sid, agent=agent, project=project, start=t0, end=t1, entries=n, tools=ntool, first_user=fu, last_assistant=la))
+            origin, title = meta.get(sid, (None, None))
+            out.append(dict(session=sid, agent=agent, project=proj, start=t0, end=t1, entries=n, tools=ntool,
+                            origin=origin, title=title, path_mentions=touch_note(sid, proj),
+                            first_user=fu, last_assistant=la))
         print(json.dumps(out, ensure_ascii=False))
         return
     lines = [HEADER, "(각 세션은 첫 요청·마지막 결론만 발췌. 전개는 `timecapsule session <id>`)"]
     if not rows:
         lines.append("(이 프로젝트의 세션 기록 없음)")
-    budget = args.max_chars
-    for sid, agent, project, t0, t1, n, ntool in rows:
+    for sid, agent, proj, t0, t1, n, ntool in rows:
         fu, la = first_last(con, sid)
         fu = " ".join(fu.split())[:240]
         la = " ".join(la.split())[:360]
-        block = (f"\n## {fmt_ts(t0)} → {fmt_ts(t1)} · {agent} · {short_project(project)} · {sid[:8]} · 항목 {n} (도구 {ntool or 0})\n"
-                 f"- 요청: {fu or '-'}\n- 마지막 결론: {la or '-'}")
-        if sum(len(x) for x in lines) + len(block) > budget:
+        title = meta.get(sid, (None, None))[1]
+        k = touch_note(sid, proj)
+        block = (f"\n## {fmt_ts(t0)} → {fmt_ts(t1)} · {agent} · {short_project(proj)} · {sid[:8]} · 항목 {n} (도구 {ntool or 0})"
+                 + (f" · 작업폴더 밖(이 경로 언급 {k}회)" if k else "") + "\n"
+                 + (f"- 제목: {title}\n" if title else "")
+                 + f"- 요청: {fu or '-'}\n- 마지막 결론: {la or '-'}")
+        if sum(len(x) for x in lines) + len(block) > args.max_chars:
             lines.append("\n(길이 상한으로 이하 생략)")
             break
         lines.append(block)
     print("\n".join(lines))
 
 
+def match_sessions(con, prefix, limit=20):
+    return [r[0] for r in con.execute(
+        "SELECT DISTINCT session_id FROM entries WHERE session_id >= ? AND session_id < ? LIMIT ?",
+        (prefix, prefix + "\uffff", limit))]
+
+
+def describe_session(con, sid):
+    agent, proj, t0, t1, n = con.execute(
+        "SELECT MAX(agent), MAX(project), MIN(ts), MAX(ts), COUNT(*) FROM entries WHERE session_id=?", (sid,)).fetchone()
+    return agent, proj, t0, t1, n
+
+
+def ambiguous(con, prefix, sids):
+    print(f"({len(sids)}개 이상의 세션이 '{prefix}' 로 시작한다 — 더 길게 적어라)")
+    for s in sids:
+        agent, proj, t0, t1, n = describe_session(con, s)
+        fu, _ = first_last(con, s)
+        print(f"  {s} · {fmt_ts(t0)} · {agent} · {short_project(proj)} · 항목 {n} · {' '.join(fu.split())[:80]}")
+
+
 def cmd_session(args):
     con = connect()
-    rows = con.execute(
-        "SELECT ts, role, text FROM entries WHERE session_id LIKE ? ORDER BY ts, id", (args.id + "%",)
-    ).fetchall()
-    if not rows:
+    sids = match_sessions(con, args.id)
+    if not sids:
         print("(세션 없음)")
         return
+    if len(sids) > 1:
+        ambiguous(con, args.id, sids)
+        return
+    sid = sids[0]
+    q, params = "FROM entries WHERE session_id=?", [sid]
+    if args.role:
+        q += " AND role=?"
+        params.append(args.role)
+    total = con.execute("SELECT COUNT(*) " + q, params).fetchone()[0]
+    rows = con.execute("SELECT ts, role, text, path, line " + q + " ORDER BY ts, id LIMIT ? OFFSET ?",
+                       params + [args.limit if args.limit else -1, args.offset]).fetchall()
+    agent, proj, t0, t1, _ = describe_session(con, sid)
+    origin, title = session_meta(con, [sid]).get(sid, (None, None))
     print(HEADER)
-    for ts, role, text in rows:
+    print(f"# {sid} · {agent}" + (f"({origin})" if origin else "") + f" · {short_project(proj)} · {fmt_ts(t0)} → {fmt_ts(t1)}"
+          + (f" · {title}" if title else "") + f" · 항목 {total}")
+    for ts, role, text, path, line in rows:
         text = " ".join(text.split())
         print(f"[{fmt_ts(ts)}] {role}: {text[: args.width]}")
+        if args.src:
+            print(f"    ↳ {src_ref(path, line)}")
+    shown = args.offset + len(rows)
+    if shown < total:
+        print(f"(… {total - shown}개 더 — --offset {shown})")
 
 
 def cmd_tools(args):
-    """지난 세션에서 무슨 도구를 썼는지 — cch 의 훅 이벤트 조회를 대신한다. 서브에이전트 기록은 제외된다."""
+    """지난 세션에서 무슨 도구를 썼는지. 서브에이전트 기록은 제외된다."""
     con = connect()
     if args.session:
-        where, params = "session_id LIKE ?", (args.session + "%",)
+        where, params = "session_id >= ? AND session_id < ?", (args.session, args.session + "\uffff")
     else:
-        where, params = project_filter_sql(args.project)
+        where, params, _ = scope_sql(con, args.project, touched=False, a="")
         if args.days:
-            since = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
             where += " AND ts >= ?"
-            params += (since,)
-    rows = con.execute(
-        "SELECT text FROM entries WHERE role='tool' AND " + where + " ORDER BY ts", params
-    ).fetchall()
+            params += (since(args.days),)
+    rows = con.execute("SELECT text FROM entries WHERE role='tool' AND " + where + " ORDER BY ts", params).fetchall()
     counts = {}
     samples = {}
     for (t,) in rows:
@@ -529,15 +955,123 @@ def cmd_tools(args):
             print(f"  {n:6d}  {k}")
 
 
+# ---------------------------------------------------------------- 관리
+def backup_db(con):
+    dst_path = DB_PATH + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    dst = sqlite3.connect(dst_path)
+    try:
+        con.backup(dst)
+    finally:
+        dst.close()
+    os.chmod(dst_path, 0o600)
+    return dst_path
+
+
+def compact_db(con):
+    """지운 행의 흔적까지 없앤다 — FTS 세그먼트 병합 · 파일 재작성 · WAL 비우기."""
+    con.execute("INSERT INTO fts(fts) VALUES('optimize')")
+    con.execute("VACUUM")
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
+def cmd_forget(args):
+    con = connect()
+    sids = match_sessions(con, args.id)
+    if not sids:
+        print("(세션 없음)")
+        return
+    if len(sids) > 1:
+        ambiguous(con, args.id, sids)
+        return
+    sid = sids[0]
+    agent, proj, t0, t1, n = describe_session(con, sid)
+    paths = [r[0] for r in con.execute("SELECT DISTINCT path FROM entries WHERE session_id=? AND path IS NOT NULL", (sid,))]
+    print(f"대상: {sid} · {agent} · {short_project(proj)} · {fmt_ts(t0)} → {fmt_ts(t1)} · 항목 {n}")
+    for p in paths:
+        print(f"  원본: {short_project(p)}" + ("" if os.path.exists(p) else " (이미 없음)"))
+    if not args.yes:
+        print("(시험 실행 — 지우려면 --yes)")
+        return
+    con.execute("PRAGMA secure_delete=ON")
+    with Tx(con):
+        con.execute("DELETE FROM entries WHERE session_id=?", (sid,))
+        con.execute("DELETE FROM sessions WHERE session_id=?", (sid,))
+        for p in paths:
+            if agent == "claude-mem" or con.execute("SELECT 1 FROM entries WHERE path=? LIMIT 1", (p,)).fetchone():
+                continue  # 다른 세션과 같이 쓰는 원천(claude-mem DB 등)은 표시하지 않는다
+            con.execute(FILES_UPSERT, (p, 0, 0, 0, agent, sid, proj, time.time(), None))
+            con.execute("UPDATE files SET forgotten=1 WHERE path=?", (p,))  # 원본이 자라도 다시 색인하지 않는다
+    compact_db(con)
+    print(f"색인에서 {n}개 항목을 지웠다. 이 원본 파일은 앞으로 색인하지 않는다.")
+    live = [p for p in paths if os.path.exists(p)]
+    if live:
+        print("원본 파일은 남아 있다 — 비밀값 때문이라면 직접 지워라:")
+        for p in live:
+            print(f"  {p}")
+    baks = sorted(glob.glob(DB_PATH + ".bak-*"))
+    if baks:
+        print(f"주의: 백업 {len(baks)}개({os.path.basename(baks[0])} …)에는 이 기록이 그대로 남아 있다.")
+
+
+def cmd_rebuild(args):
+    con = connect()
+    rows = con.execute("SELECT path, agent, forgotten FROM files").fetchall()
+    live = [(a, p) for p, a, fg in rows if not fg and a in TRANSCRIPT_AGENTS + ("markdown",) and os.path.exists(p)]
+    live_set = {p for _, p in live}
+    con.execute("CREATE TEMP TABLE IF NOT EXISTS live(path TEXT PRIMARY KEY)")
+    con.execute("DELETE FROM live")
+    con.executemany("INSERT OR IGNORE INTO live(path) VALUES(?)", [(p,) for p in live_set])
+    kept = con.execute("SELECT COUNT(*) FROM entries WHERE path IS NULL OR path NOT IN (SELECT path FROM live)").fetchone()[0]
+    print(f"다시 색인: 원본이 있는 파일 {len(live)}개")
+    print(f"보존: 원본이 없거나 이관된 기록 {kept}행 — 지우지 않고 새 걸러내기·가림 규칙만 적용한다")
+    if not args.yes:
+        print("(시험 실행 — 실행하려면 --yes. 시작 전에 DB 백업을 만든다)")
+        return
+    if not args.no_backup:
+        print(f"백업: {backup_db(con)}")
+    t0 = time.time()
+    added = 0
+    for agent, path in live:
+        added += index_file(con, agent, path, Budget(None), reset=True)
+    dropped = relabeled = masked = 0
+    with Tx(con):
+        orphans = con.execute("SELECT id, agent, role, text FROM entries"
+                              " WHERE path IS NULL OR path NOT IN (SELECT path FROM live)").fetchall()
+        for eid, agent, role, text in orphans:
+            if agent in ("claude", "cowork") and role == "user":
+                if any(mk in text for mk in SKIP_MARKERS):
+                    con.execute("DELETE FROM entries WHERE id=?", (eid,))
+                    dropped += 1
+                    continue
+                if text.startswith(CONTINUATION):
+                    con.execute("UPDATE entries SET role='summary' WHERE id=?", (eid,))
+                    relabeled += 1
+            new = redact(text)
+            if new != text:
+                con.execute("UPDATE entries SET text=? WHERE id=?", (new, eid))
+                masked += 1
+    more, _ = run_index(con, Budget(None))  # 새로 잡히는 원천(Cowork 등)
+    compact_db(con)
+    print(f"완료 {time.time() - t0:.0f}초 · 다시 넣은 항목 {added + more} · 보존 기록 중 걸러냄 {dropped} · 요약으로 재분류 {relabeled}"
+          f" · 비밀값 재가림 {masked}")
+
+
 def cmd_stats(args):
     con = connect()
-    print(f"db: {DB_PATH} ({os.path.getsize(DB_PATH)//1024//1024} MB) · tokenizer: {tokenizer(con)}")
+    size = sum(os.path.getsize(p) for p in (DB_PATH, DB_PATH + "-wal") if os.path.exists(p))
+    print(f"db: {DB_PATH} ({size // 1024 // 1024} MB) · tokenizer: {tokenizer(con)} · schema {schema_version(con)}")
     last = con.execute("SELECT v FROM meta WHERE k='last_index'").fetchone()
     print(f"last index: {last[0] if last else '-'}")
     for agent, n, s, t0, t1 in con.execute(
         "SELECT agent, COUNT(*), COUNT(DISTINCT session_id), MIN(ts), MAX(ts) FROM entries GROUP BY agent"
     ):
         print(f"{agent:10s} entries {n:7d} · sessions {s:5d} · {t0[:10]} ~ {t1[:10]}")
+    origins = con.execute("SELECT COALESCE(origin,'-'), COUNT(*) FROM sessions GROUP BY 1 ORDER BY 2 DESC").fetchall()
+    if origins:
+        print("session origins: " + ", ".join(f"{o} {n}" for o, n in origins))
+    fg = con.execute("SELECT COUNT(*) FROM files WHERE forgotten=1").fetchone()[0]
+    if fg:
+        print(f"forgotten files: {fg}")
     print("projects (top 10):")
     for p, n in con.execute(
         "SELECT project, COUNT(DISTINCT session_id) FROM entries WHERE project IS NOT NULL GROUP BY project ORDER BY 2 DESC LIMIT 10"
@@ -555,57 +1089,341 @@ def cmd_migrate_claude_mem(args):
     if done and not args.force:
         print(f"이미 이관됨 ({done}건). 다시 하려면 --force")
         return
-    con.execute("DELETE FROM entries WHERE agent='claude-mem'")
     s = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     n = 0
-    for sid, project, title, subtitle, text, facts, narrative, created in s.execute(
-        "SELECT memory_session_id, project, title, subtitle, text, facts, narrative, created_at FROM observations"
-    ):
-        parts = [x for x in (title, subtitle, narrative or text, facts) if x]
-        body = "\n".join(str(x) for x in parts)
-        if len(body) < 20:
-            continue
-        con.execute(
-            "INSERT INTO entries(agent, project, session_id, ts, role, text, path, line) VALUES(?,?,?,?,?,?,?,?)",
-            ("claude-mem", project, f"cm:{sid}", created or "", "observation", redact(clip(body, 3000)), src, n),
-        )
-        n += 1
-    try:
-        for sid, project, request, investigated, learned, completed, nxt, created in s.execute(
-            "SELECT memory_session_id, project, request, investigated, learned, completed, next_steps, created_at FROM session_summaries"
+    with Tx(con):
+        con.execute("DELETE FROM entries WHERE agent='claude-mem'")
+        for sid, project, title, subtitle, text, facts, narrative, created in s.execute(
+            "SELECT memory_session_id, project, title, subtitle, text, facts, narrative, created_at FROM observations"
         ):
-            body = "\n".join(f"{k}: {v}" for k, v in (("요청", request), ("조사", investigated), ("배운 것", learned), ("완료", completed), ("다음", nxt)) if v)
+            parts = [x for x in (title, subtitle, narrative or text, facts) if x]
+            body = "\n".join(str(x) for x in parts)
             if len(body) < 20:
                 continue
             con.execute(
                 "INSERT INTO entries(agent, project, session_id, ts, role, text, path, line) VALUES(?,?,?,?,?,?,?,?)",
-                ("claude-mem", project, f"cm:{sid}", created or "", "summary", redact(clip(body, 3000)), src, n),
+                ("claude-mem", project, f"cm:{sid}", created or "", "observation", clip(redact(body), NOTE_CAP), src, n),
             )
             n += 1
-    except sqlite3.OperationalError:
-        pass
-    con.commit()
+        try:
+            for sid, project, request, investigated, learned, completed, nxt, created in s.execute(
+                "SELECT memory_session_id, project, request, investigated, learned, completed, next_steps, created_at FROM session_summaries"
+            ):
+                body = "\n".join(f"{k}: {v}" for k, v in (("요청", request), ("조사", investigated), ("배운 것", learned),
+                                                          ("완료", completed), ("다음", nxt)) if v)
+                if len(body) < 20:
+                    continue
+                con.execute(
+                    "INSERT INTO entries(agent, project, session_id, ts, role, text, path, line) VALUES(?,?,?,?,?,?,?,?)",
+                    ("claude-mem", project, f"cm:{sid}", created or "", "summary", clip(redact(body), NOTE_CAP), src, n),
+                )
+                n += 1
+        except sqlite3.OperationalError:
+            pass
     print(f"claude-mem 이관 {n}건 (출처 agent='claude-mem')")
 
 
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
 def cmd_doctor(args):
-    cfg = load_config()
-    src = discover_sources(cfg)
+    src = discover_sources(load_config())
     by = {}
     for a, _ in src:
         by[a] = by.get(a, 0) + 1
     print(f"timecapsule {VERSION} · home {TC_HOME}")
-    print(f"sources: " + ", ".join(f"{k} {v}" for k, v in by.items()) if by else "sources: 없음")
+    print("sources: " + (", ".join(f"{k} {v}" for k, v in by.items()) if by else "없음"))
     try:
         con = connect()
-        print(f"db ok · tokenizer {tokenizer(con)} · sqlite {sqlite3.sqlite_version}")
+        print(f"db ok · schema {schema_version(con)} · tokenizer {tokenizer(con)} · sqlite {sqlite3.sqlite_version}"
+              f" · python {sys.version.split()[0]}")
         n = con.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
         f = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         print(f"entries {n} · files {f}")
     except Exception as e:
         print(f"db 오류: {e}")
-    cm = os.path.join(HOME, ".claude-mem", "claude-mem.db")
-    print(f"claude-mem db: {'있음' if os.path.exists(cm) else '없음'} ({cm})")
+    settings = read_json(CLAUDE_SETTINGS) or {}
+    for ev in ("SessionStart", "Stop"):
+        cmds = [h.get("command", "") for g in (settings.get("hooks") or {}).get(ev) or [] for h in g.get("hooks") or []]
+        mine = [c for c in cmds if "timecapsule" in c]
+        print(f"Claude Code 훅 {ev}: " + (mine[0] if mine else "없음"))
+    desk = read_json(DESKTOP_CONFIG)
+    if desk is None:
+        print("Claude 데스크톱 MCP: 설정 파일 없음")
+    else:
+        srv = (desk.get("mcpServers") or {}).get("timecapsule")
+        print("Claude 데스크톱 MCP: " + (" ".join([srv.get("command", "")] + list(srv.get("args") or [])) if srv else "없음"))
+    baks = sorted(glob.glob(DB_PATH + ".bak-*"))
+    if baks:
+        print(f"backups: {len(baks)}개 · {sum(os.path.getsize(b) for b in baks) // 1024 // 1024} MB")
+
+
+# ---------------------------------------------------------------- 훅
+def read_hook_input():
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        r, _, _ = select.select([sys.stdin], [], [], 1.0)
+        if not r:
+            return {}
+        data = sys.stdin.read()
+        o = json.loads(data) if data.strip() else {}
+        return o if isinstance(o, dict) else {}
+    except Exception:
+        return {}
+
+
+def codex_hook_kind(data):
+    """Codex 훅: 사람이 연 대화형 세션인가. 기록 첫 줄의 session_meta 로, 파일이 아직 없으면 조상 프로세스로 판정."""
+    tp = data.get("transcript_path")
+    if tp and os.path.exists(tp):
+        try:
+            with open(tp, "rb") as fh:
+                o = json.loads(fh.readline() or b"{}")
+            if o.get("type") == "session_meta":
+                meta = o.get("payload") or {}
+                return ("auto" if codex_origin(meta) in AUTO_ORIGINS else "interactive"), meta.get("id")
+        except Exception as e:
+            debug(f"codex transcript: {e}")
+    return ("auto" if ancestor_is_codex_exec() else "interactive"), None
+
+
+CODEX_VALUE_OPTS = {"-c", "--config", "-p", "--profile", "-m", "--model", "-C", "--cd", "-s", "--sandbox",
+                    "-a", "--ask-for-approval", "-i", "--image", "--enable", "--disable"}
+
+
+def codex_argv_is_exec(toks):
+    """codex 뒤 인자 → 하위 명령이 exec 인가. 값을 받는 옵션(-c model=x 등)은 값까지 건너뛴다."""
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in CODEX_VALUE_OPTS:
+            i += 2
+        elif t.startswith("-"):
+            i += 1
+        else:
+            return t in ("exec", "e")
+    return False
+
+
+def is_codex_bin(tok):
+    b = os.path.basename(tok)
+    return b in ("codex", "codex.js") or b.startswith(("codex-aarch64", "codex-x86_64"))
+
+
+def nearest_codex_is_exec(chain):
+    """조상 명령줄(가까운 순)에서 가장 가까운 codex 프로세스 하나로 판정한다.
+
+    실행 파일(argv[0], node 로 띄웠으면 argv[1])이 codex 인 프로세스만 본다 — 셸의 `-c '… codex exec …'` 같은
+    명령 문자열 속 단어에 속지 않게.
+    """
+    for argv in chain:
+        toks = argv.split()
+        if not toks:
+            continue
+        i = 1 if os.path.basename(toks[0]) in ("node", "bun", "deno") and len(toks) > 1 else 0
+        if is_codex_bin(toks[i]):
+            return codex_argv_is_exec(toks[i + 1:])
+    return False
+
+
+def ancestor_chain(depth=12):
+    import subprocess
+    pid = os.getppid()
+    for _ in range(depth):
+        if pid <= 1:
+            return
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=,args=", "-p", str(pid)], capture_output=True, text=True, timeout=2).stdout
+        except Exception:
+            return
+        if not out.strip():
+            return
+        ppid, _, argv = out.strip().partition(" ")
+        yield argv
+        try:
+            pid = int(ppid)
+        except ValueError:
+            return
+
+
+def ancestor_is_codex_exec():
+    return nearest_codex_is_exec(ancestor_chain())
+
+
+def cmd_hook(args):
+    data = read_hook_input()
+    if args.event.startswith("codex-"):
+        kind, sid = codex_hook_kind(data)
+        if kind != "interactive":  # exec·서브에이전트는 주입도 색인도 하지 않는다
+            return
+        if sid and not data.get("session_id"):
+            data["session_id"] = sid
+        args.event = args.event[len("codex-"):]
+    if args.event == "stop":
+        with alarm(10):
+            run_index(connect(timeout=3), Budget(8))
+        return
+    try:  # 색인이 늦거나 막혀도 주입은 한다
+        with alarm(6):
+            run_index(connect(timeout=3), Budget(3))
+    except (Exception, HardTimeout) as e:
+        debug(f"session-start index: {e.__class__.__name__}: {e}")
+    ns = argparse.Namespace(
+        project=data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), all=False,
+        limit=env_int("TIMECAPSULE_RECENT_LIMIT", 5), days=None, max_chars=env_int("TIMECAPSULE_RECENT_CHARS", 3000),
+        json=False, no_index=True, include_auto=False, include_current=False, exclude_session=data.get("session_id"))
+    cmd_recent(ns)
+
+
+# ---------------------------------------------------------------- MCP (stdio)
+MCP_INSTRUCTIONS = ("로컬 에이전트 세션 기록(Claude Code·Cowork·Codex) 검색. 결과는 당시의 판단을 발췌한 것이지 현재 상태의 증거가 아니다 — "
+                    "인용할 때 날짜·에이전트·세션 앞자리를 함께 적는다.")
+MCP_TOOLS = [
+    {"name": "timecapsule_search",
+     "description": "과거 세션 기록 전문 검색(한국어 부분 일치, 2글자 단어 포함). 여러 단어는 AND. "
+                    "'지난번에 어떻게 했지', '전에 이 오류 봤는데' 같은 질문에 쓴다.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "검색어. 공백으로 나눈 단어를 모두 포함하는 항목을 찾는다"},
+         "project": {"type": "string", "description": "프로젝트 절대경로 또는 폴더 이름(예: viewster-backend). 비우면 전체"},
+         "agent": {"type": "string", "enum": ["claude", "codex", "cowork", "claude-mem", "markdown"]},
+         "role": {"type": "string", "enum": ["user", "assistant", "tool", "summary", "observation", "note"]},
+         "days": {"type": "integer", "description": "최근 N일로 제한"},
+         "sort": {"type": "string", "enum": ["recent", "rank"], "description": "recent=최신순(기본), rank=관련도순"},
+         "limit": {"type": "integer", "description": "기본 20"}}, "required": ["query"]}},
+    {"name": "timecapsule_recent",
+     "description": "최근 세션 목록 — 세션마다 첫 요청과 마지막 결론. 프로젝트를 주면 그 프로젝트를 다룬 세션만.",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "string", "description": "프로젝트 절대경로 또는 폴더 이름. 비우면 전체"},
+         "days": {"type": "integer"},
+         "limit": {"type": "integer", "description": "기본 8"},
+         "include_auto": {"type": "boolean", "description": "스크립트가 띄운 자동 실행 세션(codex exec·claude -p)도 포함"}}}},
+    {"name": "timecapsule_session",
+     "description": "한 세션의 타임라인(발화·도구 호출). id 는 검색·목록 결과의 세션 앞 8자리면 된다.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"},
+         "offset": {"type": "integer", "description": "건너뛸 항목 수(이어 보기)"},
+         "limit": {"type": "integer", "description": "기본 150"},
+         "role": {"type": "string", "enum": ["user", "assistant", "tool", "summary"]}}, "required": ["id"]}},
+    {"name": "timecapsule_stats",
+     "description": "색인 통계 — 원천별 항목·세션 수, 기간, 상위 프로젝트.",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def resolve_project(name):
+    """MCP 는 작업 폴더가 없다 — 경로가 아닌 이름(viewster)은 색인에 있는 프로젝트 경로 중 폴더 이름이 같은 것으로 바꾼다."""
+    if not name or name.startswith(("/", "~")):
+        return name
+    con = connect()
+    rows = con.execute("SELECT project, COUNT(*) FROM entries WHERE project IS NOT NULL AND substr(project, 1, 1) = '/'"
+                       " AND (project = ? OR substr(project, -?) = ?) GROUP BY project ORDER BY 2 DESC",
+                       (name, len(name) + 1, "/" + name)).fetchall()
+    return rows[0][0] if rows else name
+
+
+def mcp_argv(name, a):
+    def num(k, default):
+        try:
+            return str(int(a.get(k) or default))
+        except (TypeError, ValueError):
+            return str(default)
+    if name == "timecapsule_search":
+        argv = ["search", "--limit", num("limit", 20)]
+        if a.get("project"):
+            argv += ["--project", resolve_project(str(a["project"]))]
+        for k in ("agent", "role", "sort"):
+            if a.get(k):
+                argv += ["--" + k, str(a[k])]
+        if a.get("days"):
+            argv += ["--days", num("days", 0)]
+        return argv + ["--", str(a.get("query") or "")]
+    if name == "timecapsule_recent":
+        argv = ["recent", "--limit", num("limit", 8), "--max-chars", "8000"]
+        argv += ["--project", resolve_project(str(a["project"]))] if a.get("project") else ["--all"]
+        if a.get("days"):
+            argv += ["--days", num("days", 0)]
+        if a.get("include_auto"):
+            argv.append("--include-auto")
+        return argv
+    if name == "timecapsule_session":
+        argv = ["session", "--offset", num("offset", 0), "--limit", num("limit", 150)]
+        if a.get("role"):
+            argv += ["--role", str(a["role"])]
+        return argv + ["--", str(a.get("id") or "")]
+    if name == "timecapsule_stats":
+        return ["stats"]
+    raise KeyError(name)
+
+
+def mcp_call(params):
+    name = params.get("name")
+    a = params.get("arguments") or {}
+
+    def result(text, err=False):
+        return {"content": [{"type": "text", "text": text}], "isError": err}
+    try:
+        argv = mcp_argv(name, a)
+    except KeyError:
+        return result(f"알 수 없는 도구: {name}", True)
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            ns = build_parser().parse_args(argv)
+            ns.fn(ns)
+    except SystemExit:
+        return result(err.getvalue().strip() or "인자 오류", True)
+    except Exception as e:
+        return result(f"{e.__class__.__name__}: {e}", True)
+    return result(out.getvalue() or "(출력 없음)")
+
+
+def cmd_mcp(args):
+    """MCP stdio 서버 — 줄 단위 JSON-RPC. stdout 은 프로토콜 전용이라 도구 출력은 모두 가로채서 돌려준다."""
+    stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+    real_out = sys.stdout
+
+    def send(msg):
+        real_out.write(json.dumps(msg) + "\n")  # ensure_ascii — 로캘이 없는 환경에서도 깨지지 않게
+        real_out.flush()
+    while True:
+        raw = stdin.readline()
+        if not raw:
+            break
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            req = json.loads(raw)
+        except Exception:
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+            continue
+        if not isinstance(req, dict) or req.get("id") is None:
+            continue  # 알림(notifications/*)은 답하지 않는다
+        mid, method, params = req.get("id"), req.get("method"), req.get("params") or {}
+        try:
+            if method == "initialize":
+                res = {"protocolVersion": params.get("protocolVersion") or "2025-06-18",
+                       "capabilities": {"tools": {"listChanged": False}},
+                       "serverInfo": {"name": "timecapsule", "version": VERSION},
+                       "instructions": MCP_INSTRUCTIONS}
+            elif method == "ping":
+                res = {}
+            elif method == "tools/list":
+                res = {"tools": MCP_TOOLS}
+            elif method == "tools/call":
+                res = mcp_call(params)
+            else:
+                send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"method not found: {method}"}})
+                continue
+            send({"jsonrpc": "2.0", "id": mid, "result": res})
+        except Exception as e:
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"{e.__class__.__name__}: {e}"}})
 
 
 # ---------------------------------------------------------------- main
@@ -626,16 +1444,25 @@ def build_parser():
     a.add_argument("--limit", type=int, default=5)
     a.add_argument("--days", type=int)
     a.add_argument("--max-chars", type=int, default=3000)
+    a.add_argument("--include-auto", action="store_true", help="codex exec·claude -p 같은 자동 실행 세션도")
+    a.add_argument("--include-current", action="store_true", help="지금 세션(CLAUDE_CODE_SESSION_ID)도")
+    a.add_argument("--exclude-session", help="이 세션 id 는 뺀다")
+    a.add_argument("--no-index", action="store_true", help="조회 전 짧은 색인을 건너뛴다")
     a.add_argument("--json", action="store_true")
     a.set_defaults(fn=cmd_recent)
 
     a = sub.add_parser("search", help="전문 검색")
     a.add_argument("query")
     a.add_argument("--project")
-    a.add_argument("--agent", choices=["claude", "codex", "claude-mem", "markdown"])
+    a.add_argument("--agent", choices=["claude", "codex", "cowork", "claude-mem", "markdown"])
     a.add_argument("--role", choices=["user", "assistant", "tool", "observation", "summary", "note"])
     a.add_argument("--days", type=int)
     a.add_argument("--limit", type=int, default=20)
+    a.add_argument("--sort", choices=["recent", "rank"], default="recent", help="rank=관련도(bm25)순")
+    a.add_argument("--per-session", type=int, default=3, help="세션당 최대 결과 수 (0=제한 없음)")
+    a.add_argument("--include-current", action="store_true", help="지금 세션도")
+    a.add_argument("--exclude-session")
+    a.add_argument("--no-index", action="store_true")
     a.add_argument("--json", action="store_true")
     a.add_argument("--src", action="store_true", help="원본 파일:줄 표시")
     a.set_defaults(fn=cmd_search)
@@ -643,6 +1470,10 @@ def build_parser():
     a = sub.add_parser("session", help="세션 타임라인")
     a.add_argument("id")
     a.add_argument("--width", type=int, default=300)
+    a.add_argument("--offset", type=int, default=0)
+    a.add_argument("--limit", type=int, default=0, help="0=전부")
+    a.add_argument("--role", choices=["user", "assistant", "tool", "observation", "summary", "note"])
+    a.add_argument("--src", action="store_true")
     a.set_defaults(fn=cmd_session)
 
     a = sub.add_parser("tools", help="도구 호출 집계")
@@ -652,6 +1483,16 @@ def build_parser():
     a.add_argument("--limit", type=int, default=20)
     a.add_argument("--commands", action="store_true", help="셸 명령 앞 두 토큰 집계도")
     a.set_defaults(fn=cmd_tools)
+
+    a = sub.add_parser("forget", help="한 세션을 색인에서 지운다")
+    a.add_argument("id")
+    a.add_argument("--yes", action="store_true")
+    a.set_defaults(fn=cmd_forget)
+
+    a = sub.add_parser("rebuild", help="원본이 남은 파일을 다시 색인")
+    a.add_argument("--yes", action="store_true")
+    a.add_argument("--no-backup", action="store_true")
+    a.set_defaults(fn=cmd_rebuild)
 
     a = sub.add_parser("stats", help="통계")
     a.set_defaults(fn=cmd_stats)
@@ -663,21 +1504,30 @@ def build_parser():
 
     a = sub.add_parser("doctor", help="점검")
     a.set_defaults(fn=cmd_doctor)
+
+    a = sub.add_parser("hook", help="Claude Code 훅 진입점")
+    a.add_argument("event", choices=["session-start", "stop", "codex-session-start", "codex-stop"])
+    a.set_defaults(fn=cmd_hook)
+
+    a = sub.add_parser("mcp", help="MCP stdio 서버")
+    a.set_defaults(fn=cmd_mcp)
     return p
 
 
 def main(argv=None):
+    os.umask(0o077)  # 새로 만드는 DB·WAL·백업이 처음부터 본인만 읽을 수 있게
     args = build_parser().parse_args(argv)
-    hard = getattr(args, "timeout", None)
-    if hard:
-        def _alarm(signum, frame):
-            raise TimeoutError("budget")
-        signal.signal(signal.SIGALRM, _alarm)
-        signal.alarm(int(hard) + 2)
+    hard = None
+    if args.cmd == "index":
+        hard = args.timeout or (4 if args.quick else None)
     try:
-        args.fn(args)
-    except TimeoutError:
-        debug("timeout — partial result kept")
+        if hard:
+            with alarm(hard + 2):
+                args.fn(args)
+        else:
+            args.fn(args)
+    except HardTimeout:
+        debug("timeout — 끝난 파일까지 반영, 진행 중이던 파일은 다음 색인에서 다시")
     except BrokenPipeError:
         pass
     except Exception as e:
