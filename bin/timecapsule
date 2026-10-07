@@ -18,7 +18,7 @@
   timecapsule stats · doctor
   timecapsule migrate-claude-mem [--db PATH]     claude-mem 관찰 요약을 색인으로 이관
   timecapsule hook session-start|prompt|stop     Claude Code 훅 진입점 (stdin 으로 훅 JSON). prompt 는 UserPromptSubmit — 그 프롬프트와 닿는 과거 세션을 넣는다
-  timecapsule hook codex-session-start|codex-stop   Codex 훅 진입점 (exec·서브에이전트 세션은 건너뛴다)
+  timecapsule hook codex-session-start|codex-prompt|codex-stop   Codex 훅 진입점 (exec·서브에이전트 세션은 건너뛴다)
   timecapsule mcp                                MCP stdio 서버 (Claude 데스크톱 채팅용)
 
 실패하면 종료 코드 1. 훅은 자체적으로 fail-open 처리한다. 오류 상세는 TIMECAPSULE_DEBUG=1.
@@ -1758,7 +1758,7 @@ def build_parser():
     a.set_defaults(fn=cmd_doctor)
 
     a = sub.add_parser("hook", help="Claude Code 훅 진입점")
-    a.add_argument("event", choices=["session-start", "prompt", "stop", "codex-session-start", "codex-stop"])
+    a.add_argument("event", choices=["session-start", "prompt", "stop", "codex-session-start", "codex-prompt", "codex-stop"])
     a.set_defaults(fn=cmd_hook)
 
     a = sub.add_parser("mcp", help="MCP stdio 서버")

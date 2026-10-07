@@ -481,6 +481,15 @@ class CodexTest(Base):
         # 기록 파일이 아직 없으면 조상 프로세스로 판정 — 여기(unittest)는 codex exec 아래가 아니다
         r = hook("codex-session-start", {"cwd": self.proj, "transcript_path": os.path.join(self.tmp, "none.jsonl")})
         self.assertIn("지난 클로드 세션", r.stdout)
+        # codex-prompt: exec 세션은 침묵, 대화형 세션은 프롬프트와 닿는 과거 세션을 Claude Code 와 같은 JSON 으로 낸다
+        env["TIMECAPSULE_PROMPT_DAYS"] = "0"
+        r = hook("codex-prompt", {"cwd": self.proj, "transcript_path": ex, "prompt": "지난 클로드 세션 이야기 다시"})
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+        r = hook("codex-prompt", {"cwd": self.proj, "transcript_path": tui, "prompt": "지난 클로드 세션 이야기 다시"})
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "UserPromptSubmit")
+        self.assertIn("· prev ·", out["additionalContext"])
+        self.assertNotIn("· tui ·", out["additionalContext"])
 
 
 class HookAndMcpTest(Base):
