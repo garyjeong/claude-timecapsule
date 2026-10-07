@@ -11,11 +11,13 @@
   timecapsule search "질의" [--project P] [--agent A] [--days N] [--sort recent|rank]
   timecapsule session <id> [--offset N] [--limit N]   한 세션의 타임라인
   timecapsule tools [--session ID | --project P --days N]   도구 호출 집계 (주 에이전트 기록만)
+  timecapsule touched <경로> [--days N] [--limit N]   이 파일·폴더를 다룬 세션 (요청·결론·도구 줄)
+  timecapsule lessons [--project P | --all] [--days N]   사용자 교정 발화 후보 — 검토용 목록, 규칙 파일에 자동으로 쓰지 않는다
   timecapsule forget <id> [--yes]                한 세션을 색인에서 지운다 (원본 파일은 그대로)
   timecapsule rebuild [--yes]                    원본이 남은 파일을 다시 색인 (원본 없는 기록은 보존)
   timecapsule stats · doctor
   timecapsule migrate-claude-mem [--db PATH]     claude-mem 관찰 요약을 색인으로 이관
-  timecapsule hook session-start|stop            Claude Code 훅 진입점 (stdin 으로 훅 JSON)
+  timecapsule hook session-start|prompt|stop     Claude Code 훅 진입점 (stdin 으로 훅 JSON). prompt 는 UserPromptSubmit — 그 프롬프트와 닿는 과거 세션을 넣는다
   timecapsule hook codex-session-start|codex-stop   Codex 훅 진입점 (exec·서브에이전트 세션은 건너뛴다)
   timecapsule mcp                                MCP stdio 서버 (Claude 데스크톱 채팅용)
 
@@ -25,6 +27,7 @@ import argparse
 import contextlib
 import glob
 import io
+import itertools
 import json
 import os
 import re
@@ -35,7 +38,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SCHEMA = 2
 HOME = os.path.expanduser("~")
 TC_HOME = os.environ.get("TIMECAPSULE_HOME", os.path.join(HOME, ".timecapsule"))
@@ -64,7 +67,29 @@ AUTO_ORIGINS = ("codex_exec", "codex_sdk_ts", "codex_subagent", "sdk-cli", "sdk-
 CODEX_SKIP_FRAGMENTS = ("<environment_context>", "<user_instructions>", "# AGENTS.md", "<recommended_plugins>")
 CODEX_STRIP = re.compile(r"<in-app-browser-context\b[^>]*>.*?</in-app-browser-context>|</?image\b[^>]*>", re.S)
 CODEX_GUARDIAN = "The following is the Codex agent history"  # 검토 서브에이전트에 넘기는 기록 — 통째로 뺀다
-SELF_QUERY = ("timecapsule search", "timecapsule recent", "timecapsule session", "timecapsule tools")
+SELF_QUERY = ("timecapsule search", "timecapsule recent", "timecapsule session", "timecapsule tools",
+              "timecapsule touched", "timecapsule lessons")
+# ---- 프롬프트 시점 주입(UserPromptSubmit)
+PROMPT_DAYS, PROMPT_SESSIONS, PROMPT_CHARS, PROMPT_MIN_CHARS = 120, 3, 1200, 6
+# 한국어 조사·접미 — 긴 것부터 뗀다. 남는 어간이 2글자 이상일 때만 (「웹에도」→「웹」은 1글자라 못 뗀다)
+KO_SUFFIXES = ("에서는", "에서도", "으로는", "으로도", "이라는", "에게는", "한테는", "라는", "에서", "에게", "으로", "에도", "까지", "부터",
+               "처럼", "이라", "한테", "조차", "마저", "이나", "이든", "에는", "하고", "이고", "라고", "로서", "로써", "은", "는", "이", "가",
+               "을", "를", "에", "의", "도", "로", "만", "와", "과", "나", "든")
+# 검색어로 쓸모없는 상투어 — 요청 동사·접속어·지시어. 소문자로 비교한다
+STOP_TERMS = frozenset("""
+해줘 해주세요 해줄래 해봐 해보자 하자 하고 하는 해서 해도 했어 했다 하면 할까 할지 되나 된다 되는 있나 있는 없는 있다 없다 같다 같은 싶다 싶어
+조사 확인 수정 추가 적용 정리 요약 설명 알려 보여 만들어 넣어 바꿔 고쳐 진행 검토 분석 작성 처리 반영 점검 생각 질문 답변 시작 완료 준비
+그리고 그럼 그래서 그런데 하지만 또는 및 등 것 수 때 중 더 좀 잘 왜 뭐 어떤 어떻게 무엇 이거 저거 그거 이것 저것 그것 여기 거기 어디
+대하여 대해 대한 관련 관해 부분 기능 작업 코드 파일 문제 가능 필요 현재 지금 다시 전체 사용 방법 내용 결과 상태 경우 이유 정도 이번 다음 이전 오늘 어제 내일
+하나 모두 전부 먼저 일단 우선 바로 계속 아직 이미 역시 약간 매우 아주 너무 가장 제일 정말 진짜 그냥 혹시 아마 조금
+the and for with this that from into please check make add fix update use run what how why does is are can could should would want need like also then about show give list find
+tell let get set put see look read write open close new old all any some not yes no ok okay just only more most very much many when where which who will been have has had
+""".split())
+# ---- lessons: 교정·규칙 발화의 신호어. 짧고(400자 미만) 사람이 연 세션의 user 발화에서만 본다
+# 요청 동사 어미 — 이것으로 끝나는 말은 통째로 뺀다 (넣어줘·조사해줘·바꿔주세요·알려줄래)
+REQUEST_END = re.compile(r".{1,}(?:해줘|해주세요|해줄래|해봐|해보자|해라|하자|하라|해야|줘|주세요|줄래|십시오|시오|해봐요|해요)$")
+LESSON_PATTERNS = ("앞으로", "다시는", "하지 마", "하지마", "했잖아", "말라고", "라고 했", "금지", "그만", "항상", "반드시", "잊지 마", "기억해")
+LESSON_MAX_CHARS = 400
 REDACT = [
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S), "••••private-key••••"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA••••"),
@@ -725,20 +750,17 @@ def make_snippet(text, terms, width=60):
     return ("…" if start > 0 else "") + seg + ("…" if end < len(flat) else "")
 
 
-def cmd_search(args):
-    if not args.no_index:
-        auto_index()
-    con = connect()
+def match_sql(con, terms):
+    """검색어 → (FROM 절, WHERE 조각, 파라미터, snippet 식, long_t, short_t).
+
+    trigram 은 3글자 미만을 못 찾는다 → 짧은 단어는 본문 부분 일치(instr)로 거른다(한국어 2글자 단어: 배포·오류·훅).
+    """
     tok = tokenizer(con)
-    terms = [t for t in args.query.split() if t]
-    if not terms:
-        raise ValueError("질의가 비었다")
-    # trigram 은 3글자 미만을 못 찾는다 → 짧은 단어는 본문 부분 일치로 거른다(한국어 2글자 단어: 배포·오류·훅)
     if tok == "trigram":
         long_t = [t for t in terms if len(t) >= 3]
         short_t = [t for t in terms if len(t) < 3]
     else:
-        long_t, short_t = terms, []
+        long_t, short_t = list(terms), []
     params = []
     if long_t:
         frm = " FROM fts JOIN entries e ON e.id = fts.rowid WHERE fts MATCH ?"
@@ -751,6 +773,102 @@ def cmd_search(args):
     for t in short_t:
         where += " AND instr(lower(e.text), ?) > 0"
         params.append(t.lower())
+    return frm, where, params, snip, long_t, short_t
+
+
+def not_self_query_sql():
+    """과거에 돌린 timecapsule 명령(도구 기록)이 결과를 채우지 않게 하는 WHERE 조각."""
+    return (" AND NOT (e.role = 'tool' AND (" + " OR ".join(["instr(e.text, ?) > 0"] * len(SELF_QUERY)) + "))",
+            list(SELF_QUERY))
+
+
+def prompt_terms(prompt, cap=6):
+    """프롬프트 → 검색어. 영문·식별자는 2자 이상, 한국어는 조사를 떼고 2자 이상, 상투어는 뺀다. 긴 말(더 특정적)부터 cap 개."""
+    out, seen = [], set()
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9_.\-]+|[가-힣]{2,}", prompt):
+        w = w.strip("._-")
+        if re.fullmatch(r"[가-힣]+", w):
+            if REQUEST_END.match(w):
+                continue
+            for suf in KO_SUFFIXES:
+                if w.endswith(suf):
+                    # 조사를 떼고 2글자 이상 남으면 어간을 쓴다. 1글자만 남으면(웹에도·앱은) 검색어로 못 쓰니 통째로 버린다
+                    w = w[: -len(suf)] if len(w) - len(suf) >= 2 else ""
+                    break
+        lw = w.lower()
+        if len(w) < 2 or lw in STOP_TERMS or lw in seen:
+            continue
+        seen.add(lw)
+        out.append(w)
+    out.sort(key=len, reverse=True)
+    return out[:cap]
+
+
+def prompt_context(con, prompt, cwd, exclude_sid=None, days=PROMPT_DAYS, max_sessions=PROMPT_SESSIONS, max_chars=PROMPT_CHARS):
+    """프롬프트와 닿는 과거 세션 몇 개 → 주입 텍스트(없으면 ""). 전역 범위(다른 작업 폴더·Codex 포함), 같은 프로젝트를 앞에.
+
+    검색은 특정적인 조합부터 — 모든 말 AND → 둘씩 짝 → 한두 말이면 낱말. 자동 실행 세션·지금 세션은 뺀다.
+    """
+    text = (prompt or "").strip()
+    if len(text) < PROMPT_MIN_CHARS or text.startswith("/") or any(m in text for m in SKIP_MARKERS):
+        return ""
+    terms = prompt_terms(text)
+    # 말이 하나뿐이면 4글자 이상일 때만 찾는다 — 「커밋」「배포」 같은 흔한 말 하나로 무관한 세션을 끌어오지 않게
+    if not terms or (len(terms) == 1 and len(terms[0]) < 4):
+        return ""
+    p = norm_project(cwd) if cwd else None
+    plans = [terms] if len(terms) > 1 else []
+    if len(terms) > 2:
+        plans += [list(c) for c in itertools.combinations(terms, 2)][:10]
+    if len(terms) <= 2:
+        plans += [[t] for t in terms]
+    found = {}
+    auto = ",".join("?" * len(AUTO_ORIGINS))
+    for plan in plans:
+        frm, where, params, snip, long_t, short_t = match_sql(con, plan)
+        where += " AND e.role IN ('user','assistant','summary') AND e.agent IN ('claude','codex','cowork')"
+        where += " AND e.session_id NOT IN (SELECT session_id FROM sessions WHERE origin IN (" + auto + "))"
+        params += list(AUTO_ORIGINS)
+        if days:
+            where += " AND e.ts >= ?"
+            params.append(since(days))
+        if exclude_sid:
+            where += " AND e.session_id != ?"
+            params.append(exclude_sid)
+        order = "bm25(fts), e.ts DESC" if long_t else "e.ts DESC"
+        sql = "SELECT e.ts, e.agent, e.project, e.session_id, " + snip + ", e.text" + frm + where + " ORDER BY " + order + " LIMIT 40"
+        rows = con.execute(sql, params).fetchall()
+        rows.sort(key=lambda r: 0 if (p and in_cwd(r[2], p)) else 1)  # 같은 프로젝트 먼저 — 안정 정렬이라 관련도 순은 유지
+        for ts_, agent, proj, sid, snippet, body in rows:
+            if sid in found:
+                continue
+            seg = snippet if (snippet and not short_t) else make_snippet(body, short_t + long_t)
+            found[sid] = (plan, ts_, agent, proj, " ".join(seg.split()))
+            if len(found) >= max_sessions:
+                break
+        if len(found) >= max_sessions:
+            break
+    if not found:
+        return ""
+    lines = [HEADER, f"(이 프롬프트와 닿는 과거 세션 — 검색어: {' '.join(terms)}. 전개는 `timecapsule session <id>`)"]
+    for sid, (plan, ts_, agent, proj, seg) in found.items():
+        fu, la = first_last(con, sid)
+        block = (f"\n## {fmt_ts(ts_)} · {agent} · {short_project(proj)} · {sid[:8]} · 맞은 말: {' '.join(plan)}\n"
+                 f"- 요청: {' '.join(fu.split())[:200] or '-'}\n- 대목: {seg[:220]}\n- 마지막 결론: {' '.join(la.split())[:240] or '-'}")
+        if sum(len(x) for x in lines) + len(block) > max_chars:
+            break
+        lines.append(block)
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+def cmd_search(args):
+    if not args.no_index:
+        auto_index()
+    con = connect()
+    terms = [t for t in args.query.split() if t]
+    if not terms:
+        raise ValueError("질의가 비었다")
+    frm, where, params, snip, long_t, short_t = match_sql(con, terms)
     sw, sp, _ = scope_sql(con, args.project)
     where += " AND " + sw
     params += list(sp)
@@ -767,9 +885,9 @@ def cmd_search(args):
     if cur:
         where += " AND e.session_id != ?"
         params.append(cur)
-    # 과거에 돌린 timecapsule 검색 명령 자체가 결과를 채우지 않게
-    where += " AND NOT (e.role = 'tool' AND (" + " OR ".join(["instr(e.text, ?) > 0"] * len(SELF_QUERY)) + "))"
-    params += list(SELF_QUERY)
+    nq, nparams = not_self_query_sql()  # 과거에 돌린 timecapsule 명령 자체가 결과를 채우지 않게
+    where += nq
+    params += nparams
     order = "bm25(fts), e.ts DESC" if (args.sort == "rank" and long_t) else "e.ts DESC"
     cap = max(args.limit * 25, 500) if args.per_session else args.limit
     sql = ("SELECT e.ts, e.agent, e.project, e.session_id, e.role, " + snip + ", e.path, e.line, e.text"
@@ -801,7 +919,9 @@ def cmd_search(args):
 
 
 def first_last(con, sid):
-    fu = con.execute("SELECT text FROM entries WHERE session_id=? AND role='user' ORDER BY ts, id LIMIT 1", (sid,)).fetchone()
+    # 첫 사람 말 — 데스크톱 앱이 앞에 넣는 <external_…> 같은 태그 줄은 건너뛴다(없으면 그거라도)
+    rows = con.execute("SELECT text FROM entries WHERE session_id=? AND role='user' ORDER BY ts, id LIMIT 5", (sid,)).fetchall()
+    fu = next((r for r in rows if not r[0].lstrip().startswith("<")), rows[0] if rows else None)
     la = con.execute("SELECT text FROM entries WHERE session_id=? AND role='assistant' ORDER BY ts DESC, id DESC LIMIT 1",
                      (sid,)).fetchone()
     return (fu[0] if fu else ""), (la[0] if la else "")
@@ -953,6 +1073,87 @@ def cmd_tools(args):
         print("셸 명령 앞 두 토큰 (상위):")
         for k, n in sorted(seen.items(), key=lambda kv: -kv[1])[: args.limit]:
             print(f"  {n:6d}  {k}")
+
+
+def path_needles(path):
+    """경로 → 도구 기록에서 찾을 문자열. 절대경로·~경로는 둘 다, 상대경로·파일명은 그대로(뒤쪽 일치)."""
+    path = path.strip()
+    if path.startswith(("/", "~")):
+        p = norm_project(path)
+        return [p] + (["~" + p[len(HOME):]] if p.startswith(HOME + "/") else [])
+    return [path.lstrip("./")]
+
+
+def cmd_touched(args):
+    """이 파일·폴더를 다룬 세션 — 도구 기록(Edit·Read·Bash 명령줄)에 경로가 남은 세션을 모아 요청·결론과 함께."""
+    con = connect()
+    needles = path_needles(args.path)
+    rx = re.compile("(?:" + "|".join(re.escape(n) for n in needles) + r")(?![\w.\-])")  # x.py 가 x.pyc 에 걸리지 않게
+    where = "e.role='tool' AND (" + " OR ".join(["instr(e.text, ?) > 0"] * len(needles)) + ")"
+    params = list(needles)
+    if args.days:
+        where += " AND e.ts >= ?"
+        params.append(since(args.days))
+    nq, nparams = not_self_query_sql()
+    where += nq
+    params += nparams
+    # ponytail: 전수 instr 스캔 — 21만 행에 0.2초. 느려지면 fts MATCH 로 후보를 좁힌다
+    rows = con.execute("SELECT e.session_id, e.ts, e.agent, e.project, e.text FROM entries e WHERE " + where + " ORDER BY e.ts",
+                       params).fetchall()
+    per = {}
+    for sid, ts_, agent, proj, text in rows:
+        if not rx.search(text):
+            continue
+        d = per.setdefault(sid, dict(session=sid, agent=agent, project=proj, first=ts_, last=ts_, hits=0, ops=[]))
+        d["last"], d["hits"] = ts_, d["hits"] + 1
+        op = " ".join(text.split())[:100]
+        if op not in d["ops"] and len(d["ops"]) < 3:
+            d["ops"].append(op)
+    sessions = sorted(per.values(), key=lambda d: d["last"], reverse=True)[: args.limit]
+    for d in sessions:
+        fu, la = first_last(con, d["session"])
+        d["first_user"], d["last_assistant"] = " ".join(fu.split())[:200], " ".join(la.split())[:240]
+    if args.json:
+        print(json.dumps(sessions, ensure_ascii=False))
+        return
+    print(HEADER)
+    print(f"'{args.path}' 를 다룬 세션 {len(per)}개" + (f" (최근 {args.limit}개만)" if len(per) > args.limit else ""))
+    for d in sessions:
+        print(f"\n## {fmt_ts(d['first'])} → {fmt_ts(d['last'])} · {d['agent']} · {short_project(d['project'])} · {d['session'][:8]}"
+              f" · 언급 {d['hits']}회")
+        print(f"- 요청: {d['first_user'] or '-'}\n- 마지막 결론: {d['last_assistant'] or '-'}")
+        for op in d["ops"]:
+            print(f"- 도구: {op}")
+
+
+def cmd_lessons(args):
+    """사용자 교정 발화 후보 — 검토용 목록. 규칙 파일(CLAUDE.md·AGENTS.md·메모리)에는 사람이 고른 것만 옮긴다."""
+    con = connect()
+    where = ("e.role='user' AND e.agent IN ('claude','codex','cowork') AND length(e.text) < ? AND substr(ltrim(e.text), 1, 1) != '#'"
+             " AND e.session_id NOT IN (SELECT session_id FROM sessions WHERE origin IN (" + ",".join("?" * len(AUTO_ORIGINS)) + "))"
+             " AND (" + " OR ".join(["instr(e.text, ?) > 0"] * len(LESSON_PATTERNS)) + ")")
+    params = [LESSON_MAX_CHARS] + list(AUTO_ORIGINS) + list(LESSON_PATTERNS)
+    if not args.all:
+        sw, sp, _ = scope_sql(con, args.project, touched=False)
+        where += " AND " + sw
+        params += list(sp)
+    if args.days:
+        where += " AND e.ts >= ?"
+        params.append(since(args.days))
+    rows = con.execute("SELECT e.ts, e.agent, e.project, e.session_id, e.text FROM entries e WHERE " + where
+                       + " ORDER BY e.ts DESC LIMIT ?", params + [args.limit]).fetchall()
+    out = []
+    for ts_, agent, proj, sid, text in rows:
+        flat = " ".join(text.split())
+        out.append(dict(ts=ts_, agent=agent, project=proj, session=sid,
+                        pattern=next((k for k in LESSON_PATTERNS if k in flat), ""), text=flat))
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return
+    print(HEADER)
+    print(f"교정·규칙 후보 {len(out)}건 — 검토용 목록이다. 규칙 파일에는 사람이 고른 것만 옮긴다.")
+    for r in out:
+        print(f"\n[{fmt_ts(r['ts'])}] {r['agent']} · {short_project(r['project'])} · {r['session'][:8]} · 「{r['pattern']}」\n    {r['text'][:260]}")
 
 
 # ---------------------------------------------------------------- 관리
@@ -1148,7 +1349,7 @@ def cmd_doctor(args):
     except Exception as e:
         print(f"db 오류: {e}")
     settings = read_json(CLAUDE_SETTINGS) or {}
-    for ev in ("SessionStart", "Stop"):
+    for ev in ("SessionStart", "UserPromptSubmit", "Stop"):
         cmds = [h.get("command", "") for g in (settings.get("hooks") or {}).get(ev) or [] for h in g.get("hooks") or []]
         mine = [c for c in cmds if "timecapsule" in c]
         print(f"Claude Code 훅 {ev}: " + (mine[0] if mine else "없음"))
@@ -1269,6 +1470,21 @@ def cmd_hook(args):
         with alarm(10):
             run_index(connect(timeout=3), Budget(8))
         return
+    if args.event == "prompt":  # 색인은 하지 않는다(Stop 훅이 턴마다 한다) — 조회만 짧게, 실패하면 조용히 비운다
+        text = ""
+        try:
+            with alarm(env_int("TIMECAPSULE_PROMPT_TIMEOUT", 4)):
+                text = prompt_context(
+                    connect(timeout=1.0), data.get("prompt") or "",
+                    data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(),
+                    exclude_sid=data.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                    days=env_int("TIMECAPSULE_PROMPT_DAYS", PROMPT_DAYS), max_sessions=env_int("TIMECAPSULE_PROMPT_SESSIONS", PROMPT_SESSIONS),
+                    max_chars=env_int("TIMECAPSULE_PROMPT_CHARS", PROMPT_CHARS))
+        except (Exception, HardTimeout) as e:
+            debug(f"prompt hook: {e.__class__.__name__}: {e}")
+        if text:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}, ensure_ascii=False))
+        return
     try:  # 색인이 늦거나 막혀도 주입은 한다
         with alarm(6):
             run_index(connect(timeout=3), Budget(3))
@@ -1310,6 +1526,18 @@ MCP_TOOLS = [
          "offset": {"type": "integer", "description": "건너뛸 항목 수(이어 보기)"},
          "limit": {"type": "integer", "description": "기본 150"},
          "role": {"type": "string", "enum": ["user", "assistant", "tool", "summary"]}}, "required": ["id"]}},
+    {"name": "timecapsule_touched",
+     "description": "이 파일·폴더를 다룬 세션 — 도구 기록에 경로가 남은 세션의 요청·결론·도구 줄. 절대경로·상대경로·파일명 모두 된다.",
+     "inputSchema": {"type": "object", "properties": {
+         "path": {"type": "string"},
+         "days": {"type": "integer"},
+         "limit": {"type": "integer", "description": "세션 수, 기본 10"}}, "required": ["path"]}},
+    {"name": "timecapsule_lessons",
+     "description": "사용자 교정·규칙 발화 후보(「앞으로 …」「하지 마」 등) — 검토용 목록. 규칙 파일에 자동으로 쓰지 않는다.",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "string", "description": "프로젝트 절대경로 또는 폴더 이름. 비우면 전체"},
+         "days": {"type": "integer", "description": "기본 30"},
+         "limit": {"type": "integer", "description": "기본 30"}}}},
     {"name": "timecapsule_stats",
      "description": "색인 통계 — 원천별 항목·세션 수, 기간, 상위 프로젝트.",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -1356,6 +1584,15 @@ def mcp_argv(name, a):
         if a.get("role"):
             argv += ["--role", str(a["role"])]
         return argv + ["--", str(a.get("id") or "")]
+    if name == "timecapsule_touched":
+        argv = ["touched", "--limit", num("limit", 10)]
+        if a.get("days"):
+            argv += ["--days", num("days", 0)]
+        return argv + ["--", str(a.get("path") or "")]
+    if name == "timecapsule_lessons":
+        argv = ["lessons", "--limit", num("limit", 30), "--days", num("days", 30)]
+        argv += ["--project", resolve_project(str(a["project"]))] if a.get("project") else ["--all"]
+        return argv
     if name == "timecapsule_stats":
         return ["stats"]
     raise KeyError(name)
@@ -1484,6 +1721,21 @@ def build_parser():
     a.add_argument("--commands", action="store_true", help="셸 명령 앞 두 토큰 집계도")
     a.set_defaults(fn=cmd_tools)
 
+    a = sub.add_parser("touched", help="이 파일·폴더를 다룬 세션")
+    a.add_argument("path")
+    a.add_argument("--days", type=int)
+    a.add_argument("--limit", type=int, default=10, help="세션 수")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_touched)
+
+    a = sub.add_parser("lessons", help="사용자 교정·규칙 발화 후보 (검토용)")
+    a.add_argument("--project", default=os.getcwd())
+    a.add_argument("--all", action="store_true", help="프로젝트 필터 없이")
+    a.add_argument("--days", type=int, default=30, help="0=전체 기간")
+    a.add_argument("--limit", type=int, default=30)
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_lessons)
+
     a = sub.add_parser("forget", help="한 세션을 색인에서 지운다")
     a.add_argument("id")
     a.add_argument("--yes", action="store_true")
@@ -1506,7 +1758,7 @@ def build_parser():
     a.set_defaults(fn=cmd_doctor)
 
     a = sub.add_parser("hook", help="Claude Code 훅 진입점")
-    a.add_argument("event", choices=["session-start", "stop", "codex-session-start", "codex-stop"])
+    a.add_argument("event", choices=["session-start", "prompt", "stop", "codex-session-start", "codex-stop"])
     a.set_defaults(fn=cmd_hook)
 
     a = sub.add_parser("mcp", help="MCP stdio 서버")

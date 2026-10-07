@@ -20,6 +20,8 @@ timecapsule recent [--project P] [--limit 5] [--days N] [--include-auto]
 timecapsule search "질의" [--project P] [--agent claude|codex|cowork|claude-mem] [--role user|assistant|tool|summary] [--days N] [--sort recent|rank] [--src]
 timecapsule session <id 앞 8자리> [--offset N --limit N] [--src]
 timecapsule tools [--session ID | --days N] [--commands]   # 지난 세션에 무슨 도구·명령을 썼나 (주 에이전트만)
+timecapsule touched <경로> [--days N] [--limit N]           # 이 파일·폴더를 다룬 세션 — 요청·결론·도구 줄 (절대·상대경로·파일명)
+timecapsule lessons [--days 30] [--all]                     # 「앞으로 …」「하지 마」 같은 교정 발화 후보 — 검토용. 규칙 파일에는 고른 것만 옮긴다
 timecapsule forget <id> [--yes]      # 비밀값이 든 세션을 색인에서 지운다 (--yes 없이는 시험 실행)
 timecapsule index [--quick]          # 훅과 조회 명령이 알아서 돌린다
 timecapsule stats · doctor

@@ -527,12 +527,106 @@ class HookAndMcpTest(Base):
         self.assertEqual(sorted(out), [1, 2, 3, 4, 5, 6, 7])  # 알림에는 답하지 않는다
         self.assertEqual(out[1]["result"]["protocolVersion"], "2025-06-18")
         self.assertEqual({t["name"] for t in out[2]["result"]["tools"]},
-                         {"timecapsule_search", "timecapsule_recent", "timecapsule_session", "timecapsule_stats"})
+                         {"timecapsule_search", "timecapsule_recent", "timecapsule_session", "timecapsule_stats",
+                          "timecapsule_touched", "timecapsule_lessons"})
         self.assertIn("배포", out[3]["result"]["content"][0]["text"])
         self.assertIn("지난 세션 배포 요청", out[4]["result"]["content"][0]["text"])  # 폴더 이름 → 경로
         self.assertIn("배포 완료", out[5]["result"]["content"][0]["text"])
         self.assertTrue(out[6]["result"]["isError"])
         self.assertEqual(out[7]["error"]["code"], -32601)
+
+class PromptHookTest(Base):
+    """0.3 — UserPromptSubmit 주입: 프롬프트의 말로 과거 세션을 찾는다."""
+
+    def hook(self, event, payload):
+        return subprocess.run([sys.executable, BIN, "hook", event], input=json.dumps(payload), capture_output=True,
+                              text=True, env=dict(os.environ, TIMECAPSULE_PROMPT_DAYS="0"), timeout=60)
+
+    def test_prompt_terms_strip_particles_and_stopwords(self):
+        t = self.tc.prompt_terms("정산 내역 버튼을 모바일 웹에도 넣어줘")
+        for w in ("정산", "내역", "버튼", "모바일"):
+            self.assertIn(w, t)
+        for w in ("버튼을", "넣어줘", "웹에도"):
+            self.assertNotIn(w, t)
+        self.assertEqual(self.tc.prompt_terms("agency-agents, graft 조사해줘"), ["agency-agents", "graft"])
+        self.assertIn("QR", self.tc.prompt_terms("후원 QR 카드 기본 꺼짐으로"))  # 2글자 영문 식별자
+        self.assertEqual(self.tc.prompt_terms("요약해줘"), [])
+        self.assertEqual(self.tc.prompt_terms("그리고 다시 확인해줘"), [])
+        self.assertEqual(self.tc.prompt_terms("커밋하고 푸시해줘"), ["커밋"])
+        self.assertLessEqual(len(self.tc.prompt_terms(" ".join(f"단어{i}" for i in range(20)))), 6)
+
+    def test_prompt_hook_injects_related_sessions_only(self):
+        other = os.path.join(self.ws, "other")
+        write_jsonl(self.claude_file("old1", self.proj), [cl_user("old1", self.proj, "정산 내역 버튼을 모바일 웹에 추가해줘", ts(1)),
+                                                        cl_asst("old1", self.proj, "모바일 웹 지갑에 정산 내역 버튼을 넣었다", ts(1))])
+        write_jsonl(self.claude_file("old2", other), [cl_user("old2", other, "agency-agents 와 graft 를 아는가", ts(2)),
+                                                    cl_asst("old2", other, "둘 다 안다", ts(2))])
+        write_jsonl(self.claude_file("noise", self.proj), [cl_user("noise", self.proj, "날씨 이야기", ts(3))])
+        write_jsonl(self.claude_file("cur", self.proj), [cl_user("cur", self.proj, "정산 내역 모바일 지금 세션", ts(4))])
+        self.cli("index")
+        r = self.hook("prompt", {"session_id": "cur", "cwd": self.proj, "prompt": "정산 내역 버튼을 모바일 웹에도 넣어줘"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "UserPromptSubmit")
+        ctx = out["additionalContext"]
+        self.assertIn("· old1 ·", ctx)
+        self.assertIn("요청: 정산 내역 버튼을", ctx)
+        self.assertNotIn("· cur ·", ctx)  # 지금 세션은 뺀다
+        self.assertNotIn("noise", ctx)
+        # 다른 작업 폴더의 세션도 찾는다 (전역 범위)
+        r = self.hook("prompt", {"session_id": "cur", "cwd": self.proj, "prompt": "agency-agents, graft 조사해줘"})
+        self.assertIn("· old2 ·", json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"])
+        # 짧은 말·슬래시 명령·상투어뿐·무관한 말이면 아무것도 내지 않는다
+        for p in ("응", "/clear", "요약해줘", "양자역학 강의 들려줘", "커밋하고 푸시해줘", "배포해줘"):  # 흔한 말 하나뿐이면 찾지 않는다
+            r = self.hook("prompt", {"session_id": "cur", "cwd": self.proj, "prompt": p})
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), p)
+        r = self.hook("prompt", {})  # 입력이 없어도 죽지 않는다
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""))
+
+    def test_prompt_hook_prefers_same_project_and_respects_budget(self):
+        other = os.path.join(self.ws, "other")
+        for i, (sid, cwd) in enumerate((("far", other), ("near", self.proj))):
+            write_jsonl(self.claude_file(sid, cwd), [cl_user(sid, cwd, "오버레이 위젯 배율 문제", ts(1 + i)), cl_asst(sid, cwd, "배율은 폭이 아니다", ts(1 + i))])
+        self.cli("index")
+        r = subprocess.run([sys.executable, BIN, "hook", "prompt"], input=json.dumps({"cwd": self.proj, "prompt": "오버레이 위젯 배율 문제 다시 보자"}),
+                           capture_output=True, text=True, env=dict(os.environ, TIMECAPSULE_PROMPT_DAYS="0", TIMECAPSULE_PROMPT_SESSIONS="1"), timeout=60)
+        ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("· near ·", ctx)
+        self.assertNotIn("· far ·", ctx)
+
+
+class TouchedLessonsTest(Base):
+    def test_touched_groups_tool_hits_by_session(self):
+        f1 = os.path.join(self.proj, "app", "x.py")
+        write_jsonl(self.claude_file("t1", self.proj), [cl_user("t1", self.proj, "x 를 고쳐줘", ts(1)),
+                                                      cl_tool("t1", self.proj, "Edit", {"file_path": f1}, ts(1)),
+                                                      cl_tool("t1", self.proj, "Read", {"file_path": f1}, ts(1)),
+                                                      cl_asst("t1", self.proj, "고쳤다", ts(1))])
+        write_jsonl(self.claude_file("t2", self.proj), [cl_user("t2", self.proj, "x2 를 봐줘", ts(2)),
+                                                      cl_tool("t2", self.proj, "Read", {"file_path": f1 + "c"}, ts(2))])  # x.pyc — 경계 밖
+        write_jsonl(self.claude_file("t3", self.proj), [cl_user("t3", self.proj, "검색만", ts(3)),
+                                                      cl_tool("t3", self.proj, "Bash", {"command": "timecapsule touched app/x.py"}, ts(3))])
+        self.cli("index")
+        rows = self.cjson("touched", "app/x.py")
+        self.assertEqual([r["session"] for r in rows], ["t1"])
+        self.assertEqual((rows[0]["hits"], rows[0]["first_user"], rows[0]["last_assistant"]), (2, "x 를 고쳐줘", "고쳤다"))
+        self.assertEqual([r["session"] for r in self.cjson("touched", f1)], ["t1"])  # 절대경로도
+        self.assertEqual(self.cjson("touched", "app/x.py", "--days", "1"), [])
+        self.assertIn("'app/x.py' 를 다룬 세션 1개", self.cli("touched", "app/x.py"))
+
+    def test_lessons_lists_short_interactive_corrections_only(self):
+        write_jsonl(self.claude_file("l1", self.proj), [cl_user("l1", self.proj, "앞으로 테스트는 AI-Tester 계정으로만 해", ts(1))])
+        write_jsonl(self.claude_file("l2", self.proj), [cl_user("l2", self.proj, "# 과제\n이 저장소를 읽어라. 파일을 고치지 마라", ts(2))])  # 서브에이전트 지시문
+        write_jsonl(self.claude_file("l3", self.proj), [cl_user("l3", self.proj, "하지 마 " + "가" * 500, ts(3))])  # 너무 길다
+        write_jsonl(self.claude_file("l4", self.proj), [cl_user("l4", self.proj, "오늘 날씨 좋다", ts(4))])
+        write_jsonl(self.claude_file("l5", os.path.join(self.ws, "other")), [cl_user("l5", os.path.join(self.ws, "other"), "다시는 그러지 마", ts(5))])
+        self.cli("index")
+        rows = self.cjson("lessons", "--project", self.proj, "--days", "0")
+        self.assertEqual([(r["session"], r["pattern"]) for r in rows], [("l1", "앞으로")])
+        self.assertEqual([r["session"] for r in self.cjson("lessons", "--all", "--days", "0")], ["l5", "l1"])
+        out = self.cli("lessons", "--project", self.proj, "--days", "0")
+        self.assertIn("검토용 목록", out)
+
 
 
 if __name__ == "__main__":

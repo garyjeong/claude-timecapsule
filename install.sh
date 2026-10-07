@@ -2,7 +2,7 @@
 # claude-timecapsule 설치 — 심링크 2개 + Claude Code 훅 2개 + Claude 데스크톱 MCP 1개. 되돌리기는 uninstall.sh
 #   ~/.local/bin/timecapsule            → bin/timecapsule
 #   ~/.claude/skills/timecapsule        → 이 폴더 (SKILL.md + references)
-#   ~/.claude/settings.json hooks       SessionStart / Stop 에 hooks/*.sh (중복 없이)
+#   ~/.claude/settings.json hooks       SessionStart / UserPromptSubmit / Stop 에 hooks/*.sh (중복 없이)
 #   claude_desktop_config.json          mcpServers.timecapsule (데스크톱 채팅용 — 앱을 다시 켜야 잡힌다)
 # 훅 명령 문자열은 판이 바뀌어도 그대로다 — 이미 열린 세션도 다음 턴부터 새 엔진을 쓴다.
 set -euo pipefail
@@ -38,8 +38,8 @@ if apply_json "$SETTINGS" '
     .hooks[ev] = ((.hooks[ev] // []) as $arr
       | if ($arr | map(.hooks[]?.command) | index(cmd)) then $arr
         else $arr + [{"hooks":[{"type":"command","command":cmd,"timeout":15}]}] end);
-  add("SessionStart"; $ss) | add("Stop"; $st)' \
-  --arg ss "bash $HERE/hooks/session-start.sh" --arg st "bash $HERE/hooks/stop.sh"; then
+  add("SessionStart"; $ss) | add("UserPromptSubmit"; $up) | add("Stop"; $st)' \
+  --arg ss "bash $HERE/hooks/session-start.sh" --arg up "bash $HERE/hooks/prompt.sh" --arg st "bash $HERE/hooks/stop.sh"; then
   HOOKS="등록함"; else HOOKS="이미 있음"; fi
 
 # Claude 데스크톱 MCP — GUI 앱은 셸 PATH 를 모르므로 인터프리터를 절대경로로 박는다(brew 의 고정 심링크 우선)
@@ -57,7 +57,7 @@ fi
 echo "설치 완료"
 echo "  bin   : $(readlink "$HOME/.local/bin/timecapsule")"
 echo "  skill : $(readlink "$HOME/.claude/skills/timecapsule")"
-echo "  hooks : SessionStart · Stop — $HOOKS"
+echo "  hooks : SessionStart · UserPromptSubmit · Stop — $HOOKS"
 echo "  mcp   : $MCP"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "  주의  : ~/.local/bin 이 PATH 에 없다";; esac
 echo
