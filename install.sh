@@ -51,6 +51,8 @@ if [ -d "$(dirname "$DESKTOP")" ]; then
   if apply_json "$DESKTOP" '.mcpServers.timecapsule = {"command": "/bin/sh", "args": ["-c", $launch, $bin]}' \
     --arg launch "$LAUNCH" --arg bin "$HOME/.local/bin/timecapsule"; then
     MCP="등록함 — Claude 데스크톱을 완전히 종료했다가 다시 켜야 채팅에서 잡힌다"; else MCP="이미 있음"; fi
+  # 켜져 있는 앱은 설정을 바꿀 때 기억해 둔 옛 mcpServers 로 파일을 덮어쓴다(2026-10-14 실측) — 앱을 끈 채로 돌려야 남는다. 앱 안 셸에서는 pgrep 이 앱을 못 본다
+  ps -axo comm= | grep -q "Claude.app/Contents/MacOS/Claude$" && MCP="$MCP · 주의: 앱이 켜져 있어 옛 값으로 되돌릴 수 있다 — 앱 종료 후 다시 실행"
 fi
 
 echo "설치 완료"
