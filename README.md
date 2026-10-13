@@ -2,7 +2,7 @@
 
 Claude Code · Claude 데스크톱 용 로컬 세션 메모리. 데몬·외부 추론 없이 세션 기록을 SQLite FTS5 에 색인하고, 세션 시작 때 최근 맥락을 넣어 주며, 언제든 `timecapsule search` 로 되찾는다. claude-mem 의 대체물이다.
 
-- 원천: `~/.claude/projects/*/*.jsonl`(Claude Code — CLI·데스크톱 Code 탭) + Cowork 세션 + `~/.codex/sessions/**/*.jsonl`
+- 원천: `~/.claude/projects/*/*.jsonl`(Claude Code — CLI·데스크톱 Code 탭) + Cowork 세션 + `~/.codex/sessions/**/*.jsonl`·`~/.codex/archived_sessions/*.jsonl`(보관한 대화 — 옮겨지면 색인을 이어받는다)
 - 저장: `~/.timecapsule/index.db` — 증분 색인, 파일별 오프셋·줄 수 기억, 동시 색인에도 중복 없음
 - 검색: trigram 토크나이저 + 2글자 단어는 부분 일치 (한국어)
 - 주입: SessionStart 훅이 이 프로젝트를 다룬 최근 세션 5개 요약(≤3k자)을 넣는다 — 상위 폴더·홈 세션, 자동 실행 세션, 지금 세션은 뺀다

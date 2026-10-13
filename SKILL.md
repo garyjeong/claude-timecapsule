@@ -42,7 +42,7 @@ timecapsule stats · doctor
 
 - DB: `~/.timecapsule/index.db` (원천 파일별 바이트 오프셋·줄 수를 기억해 증분 색인)
 - 설정: `~/.timecapsule/config.json` — `extra_markdown_dirs`(마크다운 아카이브 추가), `exclude_project_dirs`
-- 원천: `~/.claude/projects/*/*.jsonl`, Cowork `~/Library/Application Support/Claude/local-agent-mode-sessions/…/.claude/projects/*/*.jsonl`, `~/.codex/sessions/**/*.jsonl`
+- 원천: `~/.claude/projects/*/*.jsonl`, Cowork `~/Library/Application Support/Claude/local-agent-mode-sessions/…/.claude/projects/*/*.jsonl`, `~/.codex/sessions/**/*.jsonl`, `~/.codex/archived_sessions/*.jsonl`
 - claude-mem 에서 가져온 관찰은 `--agent claude-mem` 으로 구분된다
 - Claude 데스크톱 채팅에서는 같은 기능이 MCP 도구(`timecapsule_search`·`_recent`·`_session`·`_stats`)로 보인다
 

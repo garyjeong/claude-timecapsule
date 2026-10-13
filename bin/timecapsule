@@ -2,7 +2,7 @@
 """timecapsule — 에이전트 세션 기록을 로컬에서 색인·검색·주입하는 CLI.
 
 원천: Claude Code 세션(~/.claude/projects/*/*.jsonl) · Claude 데스크톱 Cowork 세션
-      · Codex CLI 세션(~/.codex/sessions/**/*.jsonl) · 마크다운 아카이브(선택).
+      · Codex CLI 세션(~/.codex/sessions/**/*.jsonl, 보관한 대화는 ~/.codex/archived_sessions) · 마크다운 아카이브(선택).
       데몬·외부 추론 없음. 표준 라이브러리만 쓴다(python 3.9+).
 
 명령:
@@ -38,7 +38,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SCHEMA = 2
 HOME = os.path.expanduser("~")
 TC_HOME = os.environ.get("TIMECAPSULE_HOME", os.path.join(HOME, ".timecapsule"))
@@ -47,6 +47,7 @@ CONFIG_PATH = os.path.join(TC_HOME, "config.json")
 CLAUDE_APP_DIR = os.path.join(HOME, "Library", "Application Support", "Claude")
 CLAUDE_DIR = os.environ.get("TIMECAPSULE_CLAUDE_DIR", os.path.join(HOME, ".claude", "projects"))
 CODEX_DIR = os.environ.get("TIMECAPSULE_CODEX_DIR", os.path.join(HOME, ".codex", "sessions"))
+CODEX_ARCHIVE_DIR = os.path.join(os.path.dirname(CODEX_DIR), "archived_sessions")  # Codex 가 보관한 대화의 롤아웃을 옮겨 두는 곳
 COWORK_DIR = os.environ.get("TIMECAPSULE_COWORK_DIR", os.path.join(CLAUDE_APP_DIR, "local-agent-mode-sessions"))
 CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
 DESKTOP_CONFIG = os.path.join(CLAUDE_APP_DIR, "claude_desktop_config.json")
@@ -441,7 +442,7 @@ def discover_sources(cfg):
             continue
         for f in glob.glob(os.path.join(d, "*.jsonl")):
             out.append(("claude", f))
-    for f in glob.glob(os.path.join(CODEX_DIR, "**", "*.jsonl"), recursive=True):
+    for f in glob.glob(os.path.join(CODEX_DIR, "**", "*.jsonl"), recursive=True) + glob.glob(os.path.join(CODEX_ARCHIVE_DIR, "*.jsonl")):
         out.append(("codex", f))
     # Cowork(데스크톱 로컬 에이전트): <계정>/<조직>/local_<id>/.claude/projects/<vm-cwd>/<uuid>.jsonl — audit.jsonl·subagents 는 뺀다
     for f in glob.glob(os.path.join(COWORK_DIR, "*", "*", "local_*", ".claude", "projects", "*", "*.jsonl")):
@@ -502,12 +503,28 @@ FILES_UPSERT = (
 )
 
 
+def adopt_moved(con, path):
+    """Codex 는 대화를 보관·복원할 때 롤아웃을 sessions/ ↔ archived_sessions/ 로 옮긴다(파일 이름은 그대로).
+    처음 보는 경로인데 같은 이름의 옛 경로가 사라졌으면 그 색인을 넘겨받아 중복 없이 이어 읽는다."""
+    if con.execute("SELECT 1 FROM files WHERE path=?", (path,)).fetchone():
+        return
+    name = os.path.basename(path)
+    for (old,) in con.execute("SELECT path FROM files WHERE agent='codex' AND path LIKE ?", ("%" + name,)).fetchall():
+        if os.path.basename(old) == name and not os.path.exists(old):
+            with Tx(con):
+                con.execute("UPDATE files SET path=? WHERE path=?", (path, old))
+                con.execute("UPDATE entries SET path=? WHERE path=?", (path, old))
+            return
+
+
 def index_file(con, agent, path, budget, reset=False):
     """한 파일을 기억된 오프셋부터 읽어 새 줄만 넣는다. reset 이면 그 파일의 항목을 지우고 처음부터."""
     try:
         st = os.stat(path)
     except OSError:
         return 0
+    if agent == "codex":
+        adopt_moved(con, path)
     if not reset:  # 잠금 없이 빠르게 걸러낸다 — 대부분의 파일은 여기서 끝난다
         row = con.execute("SELECT size, mtime, forgotten FROM files WHERE path=?", (path,)).fetchone()
         if row and (row[2] or unchanged(row[0], row[1], st)):
@@ -1466,6 +1483,8 @@ def cmd_hook(args):
         if sid and not data.get("session_id"):
             data["session_id"] = sid
         args.event = args.event[len("codex-"):]
+        if args.event == "session-start" and data.get("source") in ("resume", "compact"):
+            args.event = "stop"  # 이어 열기·압축 뒤에도 Codex 는 SessionStart 를 다시 부른다 — 요약은 처음 한 번이면 된다, 색인만 한다
     if args.event == "stop":
         with alarm(10):
             run_index(connect(timeout=3), Budget(8))

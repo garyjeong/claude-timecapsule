@@ -451,6 +451,23 @@ class CodexTest(Base):
         origins = dict(self.db().execute("SELECT session_id, origin FROM sessions").fetchall())
         self.assertEqual(origins, {"tui": "codex-tui", "sub": "codex_subagent", "ex": "codex_exec"})
 
+    def test_archived_rollout_continues_without_duplicates(self):
+        live = self.codex_file("r9", [codex_meta("arc", self.proj), codex_user("보관 전 요청")])
+        self.cli("index")
+        archived = os.path.join(os.path.dirname(self.codex), "archived_sessions", "r9.jsonl")
+        os.makedirs(os.path.dirname(archived))
+        os.rename(live, archived)
+        write_jsonl(archived, [codex_user("보관 직전 마지막 요청")])
+        self.codex_file("r10", [codex_meta("only", self.proj), codex_user("처음부터 보관된 세션")])
+        os.rename(os.path.join(os.path.dirname(live), "r10.jsonl"), os.path.join(os.path.dirname(archived), "r10.jsonl"))
+        self.cli("index")
+        con = self.db()
+        rows = con.execute("SELECT session_id, text, path FROM entries WHERE agent='codex' ORDER BY id").fetchall()
+        self.assertEqual(sorted((r[0], r[1]) for r in rows),
+                         sorted([("arc", "보관 전 요청"), ("arc", "보관 직전 마지막 요청"), ("only", "처음부터 보관된 세션")]))
+        self.assertTrue(all("/archived_sessions/" in r[2] for r in rows))
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM files WHERE path=?", (live,)).fetchone()[0], 0)
+
     def test_nearest_codex_process_decides(self):
         f = self.tc.nearest_codex_is_exec
         self.assertTrue(f(["bash hook.sh", "/opt/homebrew/bin/codex exec --json 'x'"]))
@@ -476,6 +493,11 @@ class CodexTest(Base):
         r = hook("codex-session-start", {"cwd": self.proj, "transcript_path": tui})
         self.assertIn("지난 클로드 세션", r.stdout)
         self.assertNotIn("지금 코덱스 세션", r.stdout)  # 자기 세션은 빠진다
+        for source in ("resume", "compact"):  # 이어 열기·압축 뒤 SessionStart 에는 다시 넣지 않는다
+            r = hook("codex-session-start", {"cwd": self.proj, "transcript_path": tui, "source": source})
+            self.assertEqual((r.returncode, r.stdout), (0, ""))
+        r = hook("codex-session-start", {"cwd": self.proj, "transcript_path": tui, "source": "clear"})
+        self.assertIn("지난 클로드 세션", r.stdout)
         r = hook("codex-stop", {"cwd": self.proj, "transcript_path": tui})
         self.assertEqual((r.returncode, r.stdout), (0, ""))
         # 기록 파일이 아직 없으면 조상 프로세스로 판정 — 여기(unittest)는 codex exec 아래가 아니다
