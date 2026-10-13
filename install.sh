@@ -42,15 +42,14 @@ if apply_json "$SETTINGS" '
   --arg ss "bash $HERE/hooks/session-start.sh" --arg up "bash $HERE/hooks/prompt.sh" --arg st "bash $HERE/hooks/stop.sh"; then
   HOOKS="등록함"; else HOOKS="이미 있음"; fi
 
-# Claude 데스크톱 MCP — GUI 앱은 셸 PATH 를 모르므로 인터프리터를 절대경로로 박는다(brew 의 고정 심링크 우선)
+# Claude 데스크톱 MCP — GUI 앱은 셸 PATH 를 모른다. 인터프리터 경로를 설치 때 박으면 brew 판 올림마다 깨졌다
+# (10-11 bin/python3 사라짐, 10-13 python@3.15 의 libexec/bin 에 python3 없음) — 띄울 때마다 /bin/sh 가 있는 것을 고른다
 MCP="데스크톱 앱 없음"
 if [ -d "$(dirname "$DESKTOP")" ]; then
-  PY=""
-  for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do [ -x "$c" ] && { PY="$c"; break; }; done
-  [ -n "$PY" ] || PY="$(python3 -c 'import sys; print(sys.executable)')"
+  LAUNCH='for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do [ -x "$p" ] && exec "$p" "$0" mcp; done; echo "timecapsule: python3 없음" >&2; exit 127'
   [ -f "$DESKTOP" ] || echo '{}' > "$DESKTOP"
-  if apply_json "$DESKTOP" '.mcpServers.timecapsule = {"command": $py, "args": [$bin, "mcp"]}' \
-    --arg py "$PY" --arg bin "$HOME/.local/bin/timecapsule"; then
+  if apply_json "$DESKTOP" '.mcpServers.timecapsule = {"command": "/bin/sh", "args": ["-c", $launch, $bin]}' \
+    --arg launch "$LAUNCH" --arg bin "$HOME/.local/bin/timecapsule"; then
     MCP="등록함 — Claude 데스크톱을 완전히 종료했다가 다시 켜야 채팅에서 잡힌다"; else MCP="이미 있음"; fi
 fi
 
