@@ -1376,6 +1376,11 @@ def cmd_doctor(args):
     else:
         srv = (desk.get("mcpServers") or {}).get("timecapsule")
         print("Claude 데스크톱 MCP: " + (" ".join([srv.get("command", "")] + list(srv.get("args") or [])) if srv else "없음"))
+        eng = (srv or {}).get("args", [""])[-1]
+        if eng.startswith(TC_HOME) and os.path.exists(eng):  # 설치 때 복사한 사본 — 엔진이 바뀌었으면 install.sh 를 다시
+            with open(eng, "rb") as a, open(os.path.realpath(sys.argv[0]), "rb") as b:
+                if a.read() != b.read():
+                    print("  주의: 데스크톱 MCP 엔진 사본이 이 엔진과 다르다 — install.sh 를 다시 돌린다(앱 종료 후)")
     baks = sorted(glob.glob(DB_PATH + ".bak-*"))
     if baks:
         print(f"backups: {len(baks)}개 · {sum(os.path.getsize(b) for b in baks) // 1024 // 1024} MB")

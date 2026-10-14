@@ -46,10 +46,14 @@ if apply_json "$SETTINGS" '
 # (10-11 bin/python3 사라짐, 10-13 python@3.15 의 libexec/bin 에 python3 없음) — 띄울 때마다 /bin/sh 가 있는 것을 고른다
 MCP="데스크톱 앱 없음"
 if [ -d "$(dirname "$DESKTOP")" ]; then
-  LAUNCH='for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do [ -x "$p" ] && exec "$p" "$0" mcp; done; echo "timecapsule: python3 없음" >&2; exit 127'
+  LAUNCH='cd /; for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do [ -x "$p" ] && exec "$p" "$0" mcp; done; echo "timecapsule: python3 없음" >&2; exit 127'
+  # 엔진은 ~/Documents 밖 사본으로 띄운다 — 앱이 띄운 python 은 ~/Documents(TCC 보호)를 못 읽는다(2026-10-14 EPERM 실측).
+  # 사본은 설치 때만 갱신되므로 엔진을 고치면 install.sh 를 다시 돌린다(doctor 가 어긋남을 알린다)
+  MCP_BIN="$HOME/.timecapsule/bin/timecapsule"
+  mkdir -p "$(dirname "$MCP_BIN")" && install -m 755 "$HERE/bin/timecapsule" "$MCP_BIN"
   [ -f "$DESKTOP" ] || echo '{}' > "$DESKTOP"
   if apply_json "$DESKTOP" '.mcpServers.timecapsule = {"command": "/bin/sh", "args": ["-c", $launch, $bin]}' \
-    --arg launch "$LAUNCH" --arg bin "$HOME/.local/bin/timecapsule"; then
+    --arg launch "$LAUNCH" --arg bin "$MCP_BIN"; then
     MCP="등록함 — Claude 데스크톱을 완전히 종료했다가 다시 켜야 채팅에서 잡힌다"; else MCP="이미 있음"; fi
   # 켜져 있는 앱은 설정을 바꿀 때 기억해 둔 옛 mcpServers 로 파일을 덮어쓴다(2026-10-14 실측) — 앱을 끈 채로 돌려야 남는다. 앱 안 셸에서는 pgrep 이 앱을 못 본다
   ps -axo comm= | grep -q "Claude.app/Contents/MacOS/Claude$" && MCP="$MCP · 주의: 앱이 켜져 있어 옛 값으로 되돌릴 수 있다 — 앱 종료 후 다시 실행"

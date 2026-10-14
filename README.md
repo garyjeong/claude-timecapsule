@@ -23,7 +23,7 @@ timecapsule migrate-claude-mem   # 옛 claude-mem 관찰 가져오기 (선택)
 ```
 
 - 훅 명령 문자열은 판이 바뀌어도 같다 — 이미 열린 Claude Code 세션도 다음 턴부터 새 엔진을 쓴다.
-- 데스크톱 MCP 는 앱을 완전히 종료했다가 다시 켜야 잡힌다.
+- 데스크톱 MCP 는 `~/.timecapsule/bin` 의 엔진 사본으로 뜬다(앱이 띄운 python 은 ~/Documents 를 못 읽는다). 엔진을 고치면 install.sh 를 다시 돌린다 — 앱이 켜져 있으면 설정을 옛 값으로 덮어쓰므로 앱을 완전히 종료한 뒤에 돌리고 다시 켠다.
 
 Codex 쪽 짝은 [codex-timecapsule](../codex-timecapsule) — 같은 엔진, 같은 DB 를 쓴다(엔진 사본은 `sync-engine.sh` 로 맞춘다).
 
